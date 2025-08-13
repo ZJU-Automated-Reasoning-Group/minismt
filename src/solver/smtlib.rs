@@ -5,6 +5,7 @@ use super::bv::{BvTerm, SortBv, BoolLit};
 use super::cnf::BitBlaster;
 use super::sat::solve_cnf;
 use super::rewrites::simplify_bv;
+use tracing::{trace, debug};
 
 fn substitute_let_vars(expr: &SExpr, substitutions: &HashMap<String, SExpr>) -> SExpr {
     match expr {
@@ -60,7 +61,9 @@ pub enum Command {
 }
 
 pub fn parse_script(input: &str) -> Result<Vec<Command>> {
-    parse_all(input)?.into_iter().map(|e| parse_command(&e)).collect()
+    let exprs = parse_all(input)?;
+    trace!(num_exprs = exprs.len(), "sexpr parsed");
+    exprs.into_iter().map(|e| parse_command(&e)).collect()
 }
 
 fn parse_command(e: &SExpr) -> Result<Command> {
@@ -80,7 +83,7 @@ fn parse_command(e: &SExpr) -> Result<Command> {
         "get-info" => { if list.len() < 2 { bail!("insufficient args for get-info") }; Ok(Command::GetInfo(atom(&list[1])?)) }
         "get-option" => { if list.len() < 2 { bail!("insufficient args for get-option") }; Ok(Command::GetOption(atom(&list[1])?)) }
         "declare-fun" | "declare-const" => {
-            let name = normalize_ident(&atom(&list[1])?);
+            let name = atom(&list[1])?;
             let sort = if head == "declare-fun" {
                 let SExpr::List(args) = &list[2] else { bail!("declare-fun needs args list") };
                 if !args.is_empty() { bail!("only zero-arity declare-fun supported") };
@@ -91,7 +94,7 @@ fn parse_command(e: &SExpr) -> Result<Command> {
             Ok(Command::DeclareConst(name, sort))
         }
         "define-fun" => {
-            let name = normalize_ident(&atom(&list[1])?);
+            let name = atom(&list[1])?;
             let SExpr::List(args) = &list[2] else { bail!("define-fun needs args list") };
             if args.is_empty() {
                 let sort = parse_sort(&list[3])?;
@@ -159,7 +162,9 @@ fn parse_sort(e: &SExpr) -> Result<SortBv> {
 
 fn parse_bv_value(s: &str) -> Result<BvTerm> {
     if s.starts_with("#b") {
-        let bits: Vec<bool> = s[2..].chars().map(|c| c == '1').collect();
+        // SMT-LIB binary literals are written MSB-first. Our internal
+        // representation is LSB-first, so reverse the bit order.
+        let bits: Vec<bool> = s[2..].chars().rev().map(|c| c == '1').collect();
         Ok(BvTerm::Value { bits })
     } else if s.starts_with("#x") {
         let hex = &s[2..];
@@ -177,6 +182,7 @@ fn parse_bv_value(s: &str) -> Result<BvTerm> {
 fn parse_term_with_env(e: &SExpr, vars: &HashMap<String, SortBv>) -> Result<BvTerm> {
     match e {
         SExpr::Atom(a) => {
+            trace!(%a, "parse atom term");
             if a.starts_with("#") { return parse_bv_value(a); }
             // Accept boolean literals in term context as 1-bit vectors
             if a == "true" { return Ok(BvTerm::Value { bits: vec![true] }); }
@@ -245,6 +251,7 @@ fn parse_term_with_env(e: &SExpr, vars: &HashMap<String, SortBv>) -> Result<BvTe
             }
             
             let head = atom(head)?;
+            trace!(head = %head, nargs = items.len() - 1, "parse list term");
             match head.as_str() {
                 "=>" => {
                     // Treat boolean implication at term level as boolean condition
@@ -491,6 +498,7 @@ impl Engine {
     pub fn new() -> Self { Self::default() }
 
     pub fn eval(&mut self, cmd: Command) -> Result<Option<String>> {
+        trace!(?cmd, num_assertions = self.assertions.len(), num_vars = self.vars.len(), "engine eval");
         match cmd {
             Command::SetLogic(_) | Command::SetOption(_, _) | Command::SetInfo(_, _) => Ok(None),
             Command::Push(n) => { for _ in 0..n { self.frames.push(self.assertions.len()); } Ok(None) }
@@ -551,6 +559,7 @@ impl Engine {
                     let term = BvTerm::Const { name: name.clone(), sort: *sort };
                     for i in 0..sort.width { let _ = bb.emit_bit(&term, i); }
                 }
+                debug!(clauses = bb.cnf.clauses.len(), vars = bb.cnf.num_vars, "check-sat CNF");
                 let res = solve_cnf(&bb.cnf)?;
                 if let Some(model_bits) = res {
                     self.last_model = Some(model_bits.clone());
@@ -582,6 +591,7 @@ impl Engine {
                     let term = BvTerm::Const { name: name.clone(), sort: *sort };
                     for i in 0..sort.width { let _ = bb.emit_bit(&term, i); }
                 }
+                debug!(clauses = bb.cnf.clauses.len(), vars = bb.cnf.num_vars, "check-sat-assuming CNF");
                 let res = solve_cnf(&bb.cnf)?;
                 if let Some(model_bits) = res {
                     self.last_model = Some(model_bits.clone());

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use tracing::{trace, debug};
 
 /// Boolean literal used in CNF clauses.
 /// The first field is the zero-based variable index, the second is the polarity (true = positive).
@@ -176,14 +177,16 @@ pub struct BitBlaster {
 
 impl BitBlaster {
     pub fn new() -> Self {
-        Self {
+        let s = Self {
             cnf: Cnf::new(),
             bool_syms: HashMap::new(),
             var_bits: HashMap::new(),
             const_true: None,
             const_false: None,
             const_bit_cache: HashMap::new(),
-        }
+        };
+        debug!("BitBlaster::new");
+        s
     }
 
     pub fn new_bool(&mut self) -> BoolLit { BoolLit(self.cnf.new_var(), true) }
@@ -310,10 +313,12 @@ impl BitBlaster {
                 let idx = i as usize;
                 let val = bits.get(idx).copied().unwrap_or(false);
                 let var = self.cnf.new_var();
-                let lit = BoolLit(var, val);
-                self.cnf.add_clause(vec![lit]);
-                self.const_bit_cache.insert(key, lit);
-                lit
+                // Enforce constant value, but expose a canonical positive literal for the bit
+                let enforce = BoolLit(var, val);
+                self.cnf.add_clause(vec![enforce]);
+                let repr = BoolLit(var, true);
+                self.const_bit_cache.insert(key, repr);
+                repr
             }
             BvTerm::Const { name, sort } => {
                 let w = sort.width;
@@ -488,7 +493,7 @@ impl BitBlaster {
     fn udiv_urem_bits(&mut self, a: &[BoolLit], b: &[BoolLit]) -> (Vec<BoolLit>, Vec<BoolLit>) {
         let w = a.len();
         assert_eq!(w, b.len());
-        // Handle b == 0: quotient all-ones, remainder = a
+        // Handle b == 0 mask
         let mut b_is_zero_terms: Vec<BoolLit> = Vec::with_capacity(w);
         for &bi in b { b_is_zero_terms.push(self.mk_not(bi)); }
         let b_is_zero = self.mk_and(&b_is_zero_terms);
@@ -513,14 +518,12 @@ impl BitBlaster {
             q[i] = ge;
         }
 
-        // Apply b==0 semantics
+        // Apply b==0 semantics (unsigned): q = all-ones, r = a
         let mut q_final: Vec<BoolLit> = Vec::with_capacity(w);
         let mut r_final: Vec<BoolLit> = Vec::with_capacity(w);
         for i in 0..w {
-            // q_i = ite(b==0, true, q_i)
             let t = self.const_lit(true);
             q_final.push(self.ite_bit(b_is_zero, t, q[i]));
-            // r_i = ite(b==0, a_i, r_i)
             r_final.push(self.ite_bit(b_is_zero, a[i], r[i]));
         }
 
@@ -535,6 +538,9 @@ impl BitBlaster {
         let a_sign = a[w - 1];
         let b_sign = b[w - 1];
         
+        // b == 0 -> return -1 (all ones)
+        let b_is_zero = self.is_zero_bits(b);
+
         // Compute absolute values
         let a_abs = self.abs_bits(a);
         let b_abs = self.abs_bits(b);
@@ -549,7 +555,10 @@ impl BitBlaster {
         let neg_q = self.negate_bits(&q_abs);
         let mut result = Vec::with_capacity(w);
         for i in 0..w {
-            result.push(self.ite_bit(result_sign, neg_q[i], q_abs[i]));
+            let signed_q = self.ite_bit(result_sign, neg_q[i], q_abs[i]);
+            // if b == 0 then -1 else signed_q
+            let neg_one_bit = self.const_lit(true);
+            result.push(self.ite_bit(b_is_zero, neg_one_bit, signed_q));
         }
         
         result
@@ -562,6 +571,9 @@ impl BitBlaster {
         // Get sign bits
         let a_sign = a[w - 1];
         
+        // b == 0 -> remainder = a
+        let b_is_zero = self.is_zero_bits(b);
+
         // Compute absolute values
         let a_abs = self.abs_bits(a);
         let b_abs = self.abs_bits(b);
@@ -573,7 +585,8 @@ impl BitBlaster {
         let neg_r = self.negate_bits(&r_abs);
         let mut result = Vec::with_capacity(w);
         for i in 0..w {
-            result.push(self.ite_bit(a_sign, neg_r[i], r_abs[i]));
+            let signed_r = self.ite_bit(a_sign, neg_r[i], r_abs[i]);
+            result.push(self.ite_bit(b_is_zero, a[i], signed_r));
         }
         
         result
@@ -591,6 +604,9 @@ impl BitBlaster {
         let a_sign = a[w - 1];
         let b_sign = b[w - 1];
         
+        // b == 0 -> result = a
+        let b_is_zero = self.is_zero_bits(b);
+
         // Compute absolute values
         let a_abs = self.abs_bits(a);
         let b_abs = self.abs_bits(b);
@@ -614,7 +630,8 @@ impl BitBlaster {
         let neg_result = self.negate_bits(&unadjusted);
         let mut result = Vec::with_capacity(w);
         for i in 0..w {
-            result.push(self.ite_bit(b_sign, neg_result[i], unadjusted[i]));
+            let signed_res = self.ite_bit(b_sign, neg_result[i], unadjusted[i]);
+            result.push(self.ite_bit(b_is_zero, a[i], signed_res));
         }
         
         result
@@ -704,7 +721,14 @@ impl BitBlaster {
             for j in 0..w { next.push(self.ite_bit(sh[i], shifted[j], cur[j])); }
             cur = next;
         }
-        cur
+
+        // If shift amount >= width, result must be all zeros
+        let limit_bits_bool = self.u128_to_lsb_bits((w - 1) as u128, sh.len());
+        let limit_bits = self.alloc_const_bits(&limit_bits_bool);
+        let is_valid = self.ule_bits(sh, &limit_bits);
+        let mut out: Vec<BoolLit> = Vec::with_capacity(w);
+        for j in 0..w { out.push(self.ite_bit(is_valid, cur[j], z)); }
+        out
     }
 
     fn var_shift_right_logical(&mut self, bits: &[BoolLit], sh: &[BoolLit]) -> Vec<BoolLit> {
@@ -721,7 +745,14 @@ impl BitBlaster {
             for j in 0..w { next.push(self.ite_bit(sh[i], shifted[j], cur[j])); }
             cur = next;
         }
-        cur
+
+        // If shift amount >= width, result must be all zeros
+        let limit_bits_bool = self.u128_to_lsb_bits((w - 1) as u128, sh.len());
+        let limit_bits = self.alloc_const_bits(&limit_bits_bool);
+        let is_valid = self.ule_bits(sh, &limit_bits);
+        let mut out: Vec<BoolLit> = Vec::with_capacity(w);
+        for j in 0..w { out.push(self.ite_bit(is_valid, cur[j], z)); }
+        out
     }
 
     fn var_shift_right_arith(&mut self, bits: &[BoolLit], sh: &[BoolLit]) -> Vec<BoolLit> {
@@ -738,7 +769,14 @@ impl BitBlaster {
             for j in 0..w { next.push(self.ite_bit(sh[i], shifted[j], cur[j])); }
             cur = next;
         }
-        cur
+
+        // If shift amount >= width, result must be all sign bits
+        let limit_bits_bool = self.u128_to_lsb_bits((w - 1) as u128, sh.len());
+        let limit_bits = self.alloc_const_bits(&limit_bits_bool);
+        let is_valid = self.ule_bits(sh, &limit_bits);
+        let mut out: Vec<BoolLit> = Vec::with_capacity(w);
+        for j in 0..w { out.push(self.ite_bit(is_valid, cur[j], sign)); }
+        out
     }
 
     fn concat_bits(&mut self, a: &[BoolLit], b: &[BoolLit]) -> Vec<BoolLit> {
@@ -752,7 +790,8 @@ impl BitBlaster {
     pub fn emit_bits(&mut self, t: &BvTerm) -> Vec<BoolLit> {
         match t {
             BvTerm::Value { bits } => {
-                // bits are LSB-first; mirror this ordering in returned literals
+                trace!(width = bits.len(), "emit const bits");
+                // bits are LSB-first; materialize canonical positive literals and enforce values separately
                 let mut lits = Vec::with_capacity(bits.len());
                 for (idx, &b) in bits.iter().enumerate() {
                     // Use bit values as cache key instead of memory address
@@ -761,8 +800,11 @@ impl BitBlaster {
                         l
                     } else {
                         let var = self.cnf.new_var();
-                        let l = BoolLit(var, b);
-                        self.cnf.add_clause(vec![l]);
+                        // Enforce value
+                        let enforce = BoolLit(var, b);
+                        self.cnf.add_clause(vec![enforce]);
+                        // Expose positive literal as the bit representation
+                        let l = BoolLit(var, true);
                         self.const_bit_cache.insert(key, l);
                         l
                     };
@@ -773,6 +815,7 @@ impl BitBlaster {
             BvTerm::Const { name, sort } => {
                 // Materialize named variable bits and cache mapping for model
                 let w = sort.width as usize;
+                trace!(%name, width = w, "emit var bits");
                 let mut out = Vec::with_capacity(w);
                 for i in 0..w {
                     let key = (name.clone(), i as u32);

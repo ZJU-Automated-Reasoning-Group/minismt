@@ -3,12 +3,14 @@ use varisat::lit::Lit;
 use varisat::solver::Solver;
 use varisat::cnf::CnfFormula;
 use varisat::ExtendFormula;
+use tracing::{debug};
 
 use super::bv::{BoolLit, Cnf};
 
 pub fn solve_cnf(c: &Cnf) -> Result<Option<Vec<bool>>> {
     let mut solver = Solver::new();
     let mut f = CnfFormula::new();
+    debug!(num_clauses = c.clauses.len(), num_vars = c.num_vars, "solve_cnf start");
     for cl in &c.clauses {
         let lits: Vec<Lit> = cl
             .iter()
@@ -30,8 +32,10 @@ pub fn solve_cnf(c: &Cnf) -> Result<Option<Vec<bool>>> {
             let sign = d > 0;
             if var < vals.len() { vals[var] = sign; }
         }
+        debug!("solve_cnf: SAT");
         Ok(Some(vals))
     } else {
+        debug!("solve_cnf: UNSAT");
         Ok(None)
     }
 }

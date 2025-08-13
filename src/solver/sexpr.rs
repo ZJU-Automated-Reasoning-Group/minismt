@@ -1,4 +1,5 @@
 use anyhow::{bail, Result};
+use tracing::trace;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SExpr {
@@ -11,6 +12,7 @@ pub fn parse_all(input: &str) -> Result<Vec<SExpr>> {
     let mut exprs = Vec::new();
     while p.skip_ws() {
         let e = p.parse_expr()?;
+        trace!(?e, "parsed sexpr");
         exprs.push(e);
     }
     Ok(exprs)
@@ -75,18 +77,14 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_atom(&mut self) -> Result<SExpr> {
-        // FIXME: this is not elegant
         if self.peek() == Some('|') {
-            // Quoted symbol: read everything until the next '|'
+            // Quoted symbol: emit the full SMT-LIB surface form as the atom, including pipes.
             assert_eq!(self.bump(), Some('|'));
-            let mut s = String::new();
+            let mut s = String::from("|");
             while let Some(c) = self.peek() {
-                if c == '|' {
-                    self.bump();
-                    break;
-                }
                 s.push(c);
                 self.bump();
+                if c == '|' { break; }
             }
             return Ok(SExpr::Atom(s));
         }
