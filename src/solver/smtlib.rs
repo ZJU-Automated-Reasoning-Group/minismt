@@ -6,6 +6,48 @@ use super::cnf::BitBlaster;
 use super::sat::solve_cnf;
 use super::rewrites::simplify_bv;
 
+fn substitute_let_vars(expr: &SExpr, substitutions: &HashMap<String, SExpr>) -> SExpr {
+    match expr {
+        SExpr::Atom(name) => {
+            if let Some(replacement) = substitutions.get(name) {
+                replacement.clone()
+            } else {
+                expr.clone()
+            }
+        }
+        SExpr::List(items) => {
+            let substituted_items: Vec<SExpr> = items.iter()
+                .map(|item| substitute_let_vars(item, substitutions))
+                .collect();
+            SExpr::List(substituted_items)
+        }
+    }
+}
+
+fn expand_let_bindings(bindings_expr: &SExpr, body_expr: &SExpr, vars: &HashMap<String, SortBv>) -> Result<BvTerm> {
+    let SExpr::List(binds) = bindings_expr else { bail!("let needs bindings list") };
+    
+    // Recursively expand all let bindings by substituting them into the body
+    let mut current_body = body_expr.clone();
+    
+    for b in binds {
+        if let SExpr::List(pair) = b {
+            let name = atom(&pair[0])?;
+            let val_expr = &pair[1];
+            
+            // Create substitution map for this binding
+            let mut substitutions = HashMap::new();
+            substitutions.insert(name, val_expr.clone());
+            
+            // Apply substitution to current body
+            current_body = substitute_let_vars(&current_body, &substitutions);
+        }
+    }
+    
+    // Parse the fully expanded body
+    parse_term_with_env(&current_body, vars)
+}
+
 #[derive(Debug, Clone)]
 pub enum Command {
     SetLogic(String), SetOption(String, String), SetInfo(String, String),
@@ -13,6 +55,7 @@ pub enum Command {
     Push(u32), Pop(u32), GetValue(Vec<String>), Reset, ResetAssertions, Exit,
     DefineFun0(String, SortBv, SExpr),
     GetInfo(String), GetOption(String),
+    CheckSatAssuming(Vec<SExpr>),
 }
 
 pub fn parse_script(input: &str) -> Result<Vec<Command>> {
@@ -59,6 +102,11 @@ fn parse_command(e: &SExpr) -> Result<Command> {
         }
         "assert" => Ok(Command::Assert(list[1].clone())),
         "check-sat" => Ok(Command::CheckSat),
+        "check-sat-assuming" => {
+            if list.len() < 2 { bail!("check-sat-assuming needs assumptions"); }
+            let SExpr::List(assumptions) = &list[1] else { bail!("check-sat-assuming needs assumptions list") };
+            Ok(Command::CheckSatAssuming(assumptions.clone()))
+        }
         "get-model" => Ok(Command::GetModel),
         "get-value" => {
             let mut vars = Vec::new();
@@ -168,16 +216,8 @@ fn parse_term_with_env(e: &SExpr, vars: &HashMap<String, SortBv>) -> Result<BvTe
             let head = atom(head)?;
             match head.as_str() {
                 "let" => {
-                    let mut local = vars.clone();
-                    let SExpr::List(binds) = &items[1] else { bail!("let needs bindings list") };
-                    for b in binds {
-                        if let SExpr::List(pair) = b {
-                            let name = atom(&pair[0])?;
-                            let val = parse_term_with_env(&pair[1], &local)?;
-                            if let Some(sort) = val.sort() { local.insert(name, sort); }
-                        }
-                    }
-                    parse_term_with_env(&items[2], &local)
+                    // Handle let bindings by expanding them recursively
+                    expand_let_bindings(&items[1], &items[2], vars)
                 }
                 "_" => {
                     let sym = atom(&items[1])?;
@@ -191,9 +231,15 @@ fn parse_term_with_env(e: &SExpr, vars: &HashMap<String, SortBv>) -> Result<BvTe
                 }
                 "bvneg" => Ok(BvTerm::Neg(Box::new(parse_term_with_env(&items[1], vars)?))),
                 "bvnot" => Ok(BvTerm::Not(Box::new(parse_term_with_env(&items[1], vars)?))),
+                "bvredor" => Ok(BvTerm::RedOr(Box::new(parse_term_with_env(&items[1], vars)?))),
+                "bvredand" => Ok(BvTerm::RedAnd(Box::new(parse_term_with_env(&items[1], vars)?))),
+                "bvredxor" => Ok(BvTerm::RedXor(Box::new(parse_term_with_env(&items[1], vars)?))),
                 "bvand" => Ok(BvTerm::And(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
+                "bvnand" => Ok(BvTerm::Nand(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
                 "bvor" => Ok(BvTerm::Or(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
                 "bvxor" => Ok(BvTerm::Xor(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
+                "bvxnor" => Ok(BvTerm::Xnor(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
+                "bvnor" => Ok(BvTerm::Nor(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
                 "bvadd" => Ok(BvTerm::Add(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
                 "bvsub" => Ok(BvTerm::Sub(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
                 "bvmul" => Ok(BvTerm::Mul(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
@@ -202,6 +248,18 @@ fn parse_term_with_env(e: &SExpr, vars: &HashMap<String, SortBv>) -> Result<BvTe
                 "bvashr" => Ok(BvTerm::Ashr(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
                 "bvudiv" => Ok(BvTerm::Udiv(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
                 "bvurem" => Ok(BvTerm::Urem(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
+                "bvsdiv" => Ok(BvTerm::Sdiv(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
+                "bvsrem" => Ok(BvTerm::Srem(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
+                "bvsmod" => Ok(BvTerm::Smod(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
+                // Overflow operations
+                "bvuaddo" => Ok(BvTerm::Uaddo(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
+                "bvsaddo" => Ok(BvTerm::Saddo(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
+                "bvusubo" => Ok(BvTerm::Usubo(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
+                "bvssubo" => Ok(BvTerm::Ssubo(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
+                "bvumulo" => Ok(BvTerm::Umulo(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
+                "bvsmulo" => Ok(BvTerm::Smulo(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
+                "bvsdivo" => Ok(BvTerm::Sdivo(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
+                "bvnego" => Ok(BvTerm::Nego(Box::new(parse_term_with_env(&items[1], vars)?))),
                 "concat" => Ok(BvTerm::Concat(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
                 "extract" => {
                     let hi = atom(&items[1])?.parse::<u32>()?;
@@ -229,11 +287,36 @@ fn parse_term_with_env(e: &SExpr, vars: &HashMap<String, SortBv>) -> Result<BvTe
                 "bvule" => Ok(BvTerm::Ule(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
                 "bvslt" => Ok(BvTerm::Slt(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
                 "bvsle" => Ok(BvTerm::Sle(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
+                // Additional comparison operations
+                "bvugt" => Ok(BvTerm::Ult(Box::new(parse_term_with_env(&items[2], vars)?), Box::new(parse_term_with_env(&items[1], vars)?))), // a > b <=> b < a
+                "bvuge" => Ok(BvTerm::Ule(Box::new(parse_term_with_env(&items[2], vars)?), Box::new(parse_term_with_env(&items[1], vars)?))), // a >= b <=> b <= a
+                "bvsgt" => Ok(BvTerm::Slt(Box::new(parse_term_with_env(&items[2], vars)?), Box::new(parse_term_with_env(&items[1], vars)?))), // a > b <=> b < a
+                "bvsge" => Ok(BvTerm::Sle(Box::new(parse_term_with_env(&items[2], vars)?), Box::new(parse_term_with_env(&items[1], vars)?))), // a >= b <=> b <= a
                 "ite" => {
                     let cond = parse_boolean_condition(&items[1], vars)?;
                     let then_t = parse_term_with_env(&items[2], vars)?;
                     let else_t = parse_term_with_env(&items[3], vars)?;
                     Ok(BvTerm::Ite(Box::new(cond), Box::new(then_t), Box::new(else_t)))
+                }
+                "xor" => {
+                    // Handle xor as boolean expression
+                    parse_boolean_condition(e, vars)
+                }
+                "distinct" => {
+                    // Handle distinct as boolean expression
+                    parse_boolean_condition(e, vars)
+                }
+                "not" => {
+                    // Handle not as boolean expression
+                    parse_boolean_condition(e, vars)
+                }
+                "and" => {
+                    // Handle and as boolean expression
+                    parse_boolean_condition(e, vars)
+                }
+                "or" => {
+                    // Handle or as boolean expression
+                    parse_boolean_condition(e, vars)
                 }
                 _ => bail!("unsupported head {}", head),
             }
@@ -260,7 +343,7 @@ fn parse_boolean_condition(e: &SExpr, vars: &HashMap<String, SortBv>) -> Result<
                         parse_term_with_env(e, vars)
                     }
                 }
-                "and" | "or" => {
+                "and" | "or" | "xor" => {
                     if items.len() >= 2 {
                         let mut conds: Vec<BvTerm> = Vec::new();
                         for i in 1..items.len() { conds.push(parse_term_with_env(&items[i], vars)?); }
@@ -271,13 +354,26 @@ fn parse_boolean_condition(e: &SExpr, vars: &HashMap<String, SortBv>) -> Result<
                                 res = BvTerm::Ite(Box::new(c), Box::new(res), Box::new(BvTerm::Value { bits: vec![false] }));
                             }
                             Ok(res)
-                        } else {
+                        } else if head == "or" {
                             // OR: res = fold: Ite(c_i, true, res) with res starting at false
                             let mut res = BvTerm::Value { bits: vec![false] };
                             for c in conds {
                                 res = BvTerm::Ite(Box::new(c), Box::new(BvTerm::Value { bits: vec![true] }), Box::new(res));
                             }
                             Ok(res)
+                        } else {
+                            // XOR: chain XOR operations
+                            if conds.is_empty() {
+                                Ok(BvTerm::Value { bits: vec![false] })
+                            } else {
+                                let mut res = conds[0].clone();
+                                for c in &conds[1..] {
+                                    // res XOR c = Ite(res, Not(c), c)
+                                    let not_c = BvTerm::Ite(Box::new(c.clone()), Box::new(BvTerm::Value { bits: vec![false] }), Box::new(BvTerm::Value { bits: vec![true] }));
+                                    res = BvTerm::Ite(Box::new(res), Box::new(not_c), Box::new(c.clone()));
+                                }
+                                Ok(res)
+                            }
                         }
                     } else {
                         parse_term_with_env(e, vars)
@@ -287,7 +383,7 @@ fn parse_boolean_condition(e: &SExpr, vars: &HashMap<String, SortBv>) -> Result<
                     if items.len() == 3 {
                         let a = parse_term_with_env(&items[1], vars)?;
                         let b = parse_term_with_env(&items[2], vars)?;
-                        Ok(BvTerm::Eq(Box::new(a), Box::new(b)))
+                        Ok(BvTerm::Not(Box::new(BvTerm::Eq(Box::new(a), Box::new(b)))))
                     } else {
                         parse_term_with_env(e, vars)
                     }
@@ -393,6 +489,41 @@ impl Engine {
                 for asexpr in &self.assertions {
                     let lit = build_bool(asexpr, &mut bb, &self.vars)?;
                     bb.cnf.add_clause(vec![lit]);
+                }
+                // Force that every boolean symbol mentioned is materialized to the CNF
+                for (name, _) in bb.bool_syms.clone() {
+                    let _ = bb.get_bool_sym(name);
+                }
+                for (name, sort) in &self.vars {
+                    let term = BvTerm::Const { name: name.clone(), sort: *sort };
+                    for i in 0..sort.width { let _ = bb.emit_bit(&term, i); }
+                }
+                let res = solve_cnf(&bb.cnf)?;
+                if let Some(model_bits) = res {
+                    self.last_model = Some(model_bits.clone());
+                    self.last_bb = Some(bb);
+                    Ok(Some("sat\n".to_string()))
+                } else {
+                    self.last_model = None;
+                    self.last_bb = None;
+                    Ok(Some("unsat\n".to_string()))
+                }
+            }
+            Command::CheckSatAssuming(assumptions) => {
+                let mut bb = BitBlaster::new();
+                // Add regular assertions
+                for asexpr in &self.assertions {
+                    let lit = build_bool(asexpr, &mut bb, &self.vars)?;
+                    bb.cnf.add_clause(vec![lit]);
+                }
+                // Add assumptions
+                for assumption in assumptions {
+                    let lit = build_bool(&assumption, &mut bb, &self.vars)?;
+                    bb.cnf.add_clause(vec![lit]);
+                }
+                // Force that every boolean symbol mentioned is materialized to the CNF
+                for (name, _) in bb.bool_syms.clone() {
+                    let _ = bb.get_bool_sym(name);
                 }
                 for (name, sort) in &self.vars {
                     let term = BvTerm::Const { name: name.clone(), sort: *sort };
@@ -572,6 +703,25 @@ fn build_bool(e: &SExpr, bb: &mut BitBlaster, vars: &HashMap<String, SortBv>) ->
                     let a = parse_bv_simplified(&list[1], vars)?; 
                     let b = parse_bv_simplified(&list[2], vars)?; 
                     Ok(bb.emit_ule_bool(&b, &a)) 
+                }
+                "=>" => {
+                    if list.len() == 3 {
+                        let a = build_bool(&list[1], bb, vars)?;
+                        let b = build_bool(&list[2], bb, vars)?;
+                        Ok(bb.mk_implies(a, b))
+                    } else {
+                        bail!("=> needs exactly 2 arguments")
+                    }
+                }
+                "ite" => {
+                    if list.len() == 4 {
+                        let cond = build_bool(&list[1], bb, vars)?;
+                        let then_b = build_bool(&list[2], bb, vars)?;
+                        let else_b = build_bool(&list[3], bb, vars)?;
+                        Ok(bb.ite_bit(cond, then_b, else_b))
+                    } else {
+                        bail!("ite needs exactly 3 arguments")
+                    }
                 }
                 _ => bail!("unsupported boolean head {}", h),
             }

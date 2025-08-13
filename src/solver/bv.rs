@@ -36,11 +36,19 @@ pub enum BvTerm {
     // Unary
     Not(Box<BvTerm>),      // bitwise not
     Neg(Box<BvTerm>),      // two's complement negation
+    
+    // Reduction operations (produce 1-bit result)
+    RedOr(Box<BvTerm>),    // OR reduction: 1 if any bit is 1, else 0
+    RedAnd(Box<BvTerm>),   // AND reduction: 1 if all bits are 1, else 0
+    RedXor(Box<BvTerm>),   // XOR reduction: 1 if odd number of bits are 1, else 0
 
     // Binary bitwise/arith
     And(Box<BvTerm>, Box<BvTerm>),
+    Nand(Box<BvTerm>, Box<BvTerm>),  // bitwise NAND
     Or(Box<BvTerm>, Box<BvTerm>),
     Xor(Box<BvTerm>, Box<BvTerm>),
+    Xnor(Box<BvTerm>, Box<BvTerm>),  // bitwise exclusive NOR
+    Nor(Box<BvTerm>, Box<BvTerm>),   // bitwise NOR
     Add(Box<BvTerm>, Box<BvTerm>),
     Sub(Box<BvTerm>, Box<BvTerm>),
     Mul(Box<BvTerm>, Box<BvTerm>),
@@ -53,6 +61,11 @@ pub enum BvTerm {
     // Division / remainder (unsigned semantics)
     Udiv(Box<BvTerm>, Box<BvTerm>),
     Urem(Box<BvTerm>, Box<BvTerm>),
+    
+    // Signed division / remainder / modulo
+    Sdiv(Box<BvTerm>, Box<BvTerm>),
+    Srem(Box<BvTerm>, Box<BvTerm>),
+    Smod(Box<BvTerm>, Box<BvTerm>),
 
     // Structural
     Concat(Box<BvTerm>, Box<BvTerm>),
@@ -69,6 +82,18 @@ pub enum BvTerm {
     Ule(Box<BvTerm>, Box<BvTerm>),              // width 1 result
     Slt(Box<BvTerm>, Box<BvTerm>),              // width 1 result
     Sle(Box<BvTerm>, Box<BvTerm>),              // width 1 result
+    
+    // Overflow detection operations (return 1-bit result)
+    Uaddo(Box<BvTerm>, Box<BvTerm>),            // unsigned addition overflow
+    Saddo(Box<BvTerm>, Box<BvTerm>),            // signed addition overflow
+    Usubo(Box<BvTerm>, Box<BvTerm>),            // unsigned subtraction overflow  
+    Ssubo(Box<BvTerm>, Box<BvTerm>),            // signed subtraction overflow
+    Umulo(Box<BvTerm>, Box<BvTerm>),            // unsigned multiplication overflow
+    Smulo(Box<BvTerm>, Box<BvTerm>),            // signed multiplication overflow
+    Sdivo(Box<BvTerm>, Box<BvTerm>),            // signed division overflow
+    
+    // Negation overflow
+    Nego(Box<BvTerm>),                          // negation overflow
 }
 
 impl BvTerm {
@@ -77,9 +102,13 @@ impl BvTerm {
             BvTerm::Value { bits } => Some(SortBv { width: bits.len() as u32 }),
             BvTerm::Const { sort, .. } => Some(*sort),
             BvTerm::Not(a) | BvTerm::Neg(a) => a.sort(),
+            BvTerm::RedOr(_) | BvTerm::RedAnd(_) | BvTerm::RedXor(_) => Some(SortBv { width: 1 }),
             BvTerm::And(a, _)
+            | BvTerm::Nand(a, _)
             | BvTerm::Or(a, _)
             | BvTerm::Xor(a, _)
+            | BvTerm::Xnor(a, _)
+            | BvTerm::Nor(a, _)
             | BvTerm::Add(a, _)
             | BvTerm::Sub(a, _)
             | BvTerm::Mul(a, _)
@@ -87,8 +116,15 @@ impl BvTerm {
             | BvTerm::Lshr(a, _)
             | BvTerm::Ashr(a, _)
             | BvTerm::Udiv(a, _)
-            | BvTerm::Urem(a, _) => a.sort(),
+            | BvTerm::Urem(a, _)
+            | BvTerm::Sdiv(a, _)
+            | BvTerm::Srem(a, _)
+            | BvTerm::Smod(a, _) => a.sort(),
             BvTerm::Eq(_, _) | BvTerm::Ult(_, _) | BvTerm::Ule(_, _) | BvTerm::Slt(_, _) | BvTerm::Sle(_, _) => None,
+            // Overflow operations return 1-bit result  
+            BvTerm::Uaddo(_, _) | BvTerm::Saddo(_, _) | BvTerm::Usubo(_, _) | BvTerm::Ssubo(_, _)
+            | BvTerm::Umulo(_, _) | BvTerm::Smulo(_, _) | BvTerm::Sdivo(_, _) => Some(SortBv { width: 1 }),
+            BvTerm::Nego(_) => Some(SortBv { width: 1 }),
             BvTerm::Concat(a, b) => {
                 let wa = a.sort()?.width;
                 let wb = b.sort()?.width;
@@ -133,7 +169,7 @@ pub struct BitBlaster {
 
     const_true: Option<BoolLit>,
     const_false: Option<BoolLit>,
-    const_bit_cache: HashMap<(usize, u32), BoolLit>,
+    const_bit_cache: HashMap<(Vec<bool>, u32), BoolLit>,
 }
 
 impl BitBlaster {
@@ -197,17 +233,17 @@ impl BitBlaster {
     pub fn encode_xor_var(&mut self, a: BoolLit, b: BoolLit) -> BoolLit {
         let y = self.new_bool();
         // y <-> a xor b
-        // (y ∨ a ∨ b)
-        // (y ∨ ¬a ∨ ¬b)
-        // (¬y ∨ a ∨ ¬b)
-        // (¬y ∨ ¬a ∨ b)
-        self.cnf.add_clause(vec![y, a, b]);
+        // (¬y ∨ ¬a ∨ ¬b) - when both inputs true, output false
+        // (¬y ∨ a ∨ b)    - when both inputs false, output false
+        // (y ∨ ¬a ∨ b)    - when a false and b true, output true
+        // (y ∨ a ∨ ¬b)    - when a true and b false, output true
         let na = self.mk_not(a);
         let nb = self.mk_not(b);
         let ny = self.mk_not(y);
-        self.cnf.add_clause(vec![y, na, nb]);
-        self.cnf.add_clause(vec![ny, a, nb]);
-        self.cnf.add_clause(vec![ny, na, b]);
+        self.cnf.add_clause(vec![ny, na, nb]);
+        self.cnf.add_clause(vec![ny, a, b]);
+        self.cnf.add_clause(vec![y, na, b]);
+        self.cnf.add_clause(vec![y, a, nb]);
         y
     }
 
@@ -267,7 +303,7 @@ impl BitBlaster {
     pub fn emit_bit(&mut self, t: &BvTerm, i: u32) -> BoolLit {
         match t {
             BvTerm::Value { bits } => {
-                let key = (t as *const BvTerm as usize, i);
+                let key = (bits.clone(), i);
                 if let Some(&lit) = self.const_bit_cache.get(&key) { return lit; }
                 let idx = i as usize;
                 let val = bits.get(idx).copied().unwrap_or(false);
@@ -351,7 +387,7 @@ impl BitBlaster {
         self.mk_or(&[case_sign, case_same])
     }
 
-    fn ite_bit(&mut self, c: BoolLit, t: BoolLit, e: BoolLit) -> BoolLit {
+    pub fn ite_bit(&mut self, c: BoolLit, t: BoolLit, e: BoolLit) -> BoolLit {
         // y = (c & t) | (!c & e)
         let a = self.mk_and(&[c, t]);
         let not_c = self.mk_not(c);
@@ -489,6 +525,134 @@ impl BitBlaster {
         (q_final, r_final)
     }
 
+    fn sdiv_bits(&mut self, a: &[BoolLit], b: &[BoolLit]) -> Vec<BoolLit> {
+        let w = a.len();
+        assert_eq!(w, b.len());
+        
+        // Get sign bits
+        let a_sign = a[w - 1];
+        let b_sign = b[w - 1];
+        
+        // Compute absolute values
+        let a_abs = self.abs_bits(a);
+        let b_abs = self.abs_bits(b);
+        
+        // Unsigned division of absolute values
+        let (q_abs, _) = self.udiv_urem_bits(&a_abs, &b_abs);
+        
+        // Result sign: negative if signs differ
+        let result_sign = self.encode_xor_var(a_sign, b_sign);
+        
+        // Conditionally negate the result
+        let neg_q = self.negate_bits(&q_abs);
+        let mut result = Vec::with_capacity(w);
+        for i in 0..w {
+            result.push(self.ite_bit(result_sign, neg_q[i], q_abs[i]));
+        }
+        
+        result
+    }
+
+    fn srem_bits(&mut self, a: &[BoolLit], b: &[BoolLit]) -> Vec<BoolLit> {
+        let w = a.len();
+        assert_eq!(w, b.len());
+        
+        // Get sign bits
+        let a_sign = a[w - 1];
+        
+        // Compute absolute values
+        let a_abs = self.abs_bits(a);
+        let b_abs = self.abs_bits(b);
+        
+        // Unsigned remainder of absolute values
+        let (_, r_abs) = self.udiv_urem_bits(&a_abs, &b_abs);
+        
+        // Result has same sign as dividend (a)
+        let neg_r = self.negate_bits(&r_abs);
+        let mut result = Vec::with_capacity(w);
+        for i in 0..w {
+            result.push(self.ite_bit(a_sign, neg_r[i], r_abs[i]));
+        }
+        
+        result
+    }
+
+    fn smod_bits(&mut self, a: &[BoolLit], b: &[BoolLit]) -> Vec<BoolLit> {
+        let w = a.len();
+        assert_eq!(w, b.len());
+        
+        // smod is different from srem:
+        // - srem has same sign as dividend
+        // - smod has same sign as divisor (and is always in range [0, |b|))
+        
+        // Get sign bits
+        let a_sign = a[w - 1];
+        let b_sign = b[w - 1];
+        
+        // Compute absolute values
+        let a_abs = self.abs_bits(a);
+        let b_abs = self.abs_bits(b);
+        
+        // Unsigned remainder of absolute values
+        let (_, r_abs) = self.udiv_urem_bits(&a_abs, &b_abs);
+        
+        // If signs differ and remainder != 0, adjust: result = |b| - r_abs
+        let signs_differ = self.encode_xor_var(a_sign, b_sign);
+        let r_is_zero = self.is_zero_bits(&r_abs);
+        let not_r_is_zero = self.mk_not(r_is_zero);
+        let need_adjust = self.mk_and(&[signs_differ, not_r_is_zero]);
+        
+        let adjusted = self.sub_bits(&b_abs, &r_abs);
+        let mut unadjusted = Vec::with_capacity(w);
+        for i in 0..w {
+            unadjusted.push(self.ite_bit(need_adjust, adjusted[i], r_abs[i]));
+        }
+        
+        // Apply divisor's sign
+        let neg_result = self.negate_bits(&unadjusted);
+        let mut result = Vec::with_capacity(w);
+        for i in 0..w {
+            result.push(self.ite_bit(b_sign, neg_result[i], unadjusted[i]));
+        }
+        
+        result
+    }
+
+    fn abs_bits(&mut self, a: &[BoolLit]) -> Vec<BoolLit> {
+        let w = a.len();
+        let sign = a[w - 1];
+        let neg_a = self.negate_bits(a);
+        let mut result = Vec::with_capacity(w);
+        for i in 0..w {
+            result.push(self.ite_bit(sign, neg_a[i], a[i]));
+        }
+        result
+    }
+
+    fn is_zero_bits(&mut self, a: &[BoolLit]) -> BoolLit {
+        let mut zero_terms = Vec::with_capacity(a.len());
+        for &bit in a {
+            zero_terms.push(self.mk_not(bit));
+        }
+        self.mk_and(&zero_terms)
+    }
+
+    fn add_bits_extended(&mut self, a: &[BoolLit], b: &[BoolLit]) -> Vec<BoolLit> {
+        assert_eq!(a.len(), b.len());
+        let w = a.len();
+        let mut out = Vec::with_capacity(w);
+        let mut carry = self.const_lit(false);
+        for i in 0..w {
+            let axb = self.encode_xor_var(a[i], b[i]);
+            let sum = self.encode_xor_var(axb, carry);
+            let carry1 = self.mk_and(&[a[i], b[i]]);
+            let carry2 = self.mk_and(&[carry, axb]);
+            carry = self.mk_or(&[carry1, carry2]);
+            out.push(sum);
+        }
+        out
+    }
+
     fn negate_bits(&mut self, a: &[BoolLit]) -> Vec<BoolLit> {
         let w = a.len();
         // two's complement: ~a + 1
@@ -589,7 +753,8 @@ impl BitBlaster {
                 // bits are LSB-first; mirror this ordering in returned literals
                 let mut lits = Vec::with_capacity(bits.len());
                 for (idx, &b) in bits.iter().enumerate() {
-                    let key = (t as *const BvTerm as usize, idx as u32);
+                    // Use bit values as cache key instead of memory address
+                    let key = (bits.clone(), idx as u32);
                     let lit = if let Some(&l) = self.const_bit_cache.get(&key) {
                         l
                     } else {
@@ -640,6 +805,45 @@ impl BitBlaster {
                 let va = self.emit_bits(a);
                 self.negate_bits(&va)
             }
+            BvTerm::RedOr(a) => {
+                if let BvTerm::Value { bits } = &**a {
+                    // OR reduction: true if any bit is true
+                    let result = bits.iter().any(|&b| b);
+                    vec![self.const_lit(result)]
+                } else {
+                    let va = self.emit_bits(a);
+                    vec![self.mk_or(&va)]
+                }
+            }
+            BvTerm::RedAnd(a) => {
+                if let BvTerm::Value { bits } = &**a {
+                    // AND reduction: true if all bits are true
+                    let result = bits.iter().all(|&b| b);
+                    vec![self.const_lit(result)]
+                } else {
+                    let va = self.emit_bits(a);
+                    vec![self.mk_and(&va)]
+                }
+            }
+            BvTerm::RedXor(a) => {
+                if let BvTerm::Value { bits } = &**a {
+                    // XOR reduction: true if odd number of bits are true
+                    let count = bits.iter().filter(|&&b| b).count();
+                    let result = (count % 2) == 1;
+                    vec![self.const_lit(result)]
+                } else {
+                    let va = self.emit_bits(a);
+                    if va.is_empty() {
+                        vec![self.const_lit(false)]
+                    } else {
+                        let mut acc = va[0];
+                        for &bit in &va[1..] {
+                            acc = self.encode_xor_var(acc, bit);
+                        }
+                        vec![acc]
+                    }
+                }
+            }
             BvTerm::And(a, b) => {
                 let va = self.emit_bits(a);
                 let vb = self.emit_bits(b);
@@ -647,7 +851,19 @@ impl BitBlaster {
                 let mut out = Vec::with_capacity(va.len());
                 for i in 0..va.len() {
                     let y = self.mk_and(&[va[i], vb[i]]);
-                    out.push(self.force_value(y, va[i].1 & vb[i].1));
+                    out.push(y);
+                }
+                out
+            }
+            BvTerm::Nand(a, b) => {
+                let va = self.emit_bits(a);
+                let vb = self.emit_bits(b);
+                assert_eq!(va.len(), vb.len());
+                let mut out = Vec::with_capacity(va.len());
+                for i in 0..va.len() {
+                    let and_y = self.mk_and(&[va[i], vb[i]]);
+                    let y = self.mk_not(and_y);
+                    out.push(y);
                 }
                 out
             }
@@ -658,7 +874,7 @@ impl BitBlaster {
                 let mut out = Vec::with_capacity(va.len());
                 for i in 0..va.len() {
                     let y = self.mk_or(&[va[i], vb[i]]);
-                    out.push(self.force_value(y, va[i].1 | vb[i].1));
+                    out.push(y);
                 }
                 out
             }
@@ -669,7 +885,31 @@ impl BitBlaster {
                 let mut out = Vec::with_capacity(va.len());
                 for i in 0..va.len() {
                     let y = self.encode_xor_var(va[i], vb[i]);
-                    out.push(self.force_value(y, va[i].1 ^ vb[i].1));
+                    out.push(y);
+                }
+                out
+            }
+            BvTerm::Xnor(a, b) => {
+                let va = self.emit_bits(a);
+                let vb = self.emit_bits(b);
+                assert_eq!(va.len(), vb.len());
+                let mut out = Vec::with_capacity(va.len());
+                for i in 0..va.len() {
+                    // XNOR is NOT(XOR)
+                    let xor = self.encode_xor_var(va[i], vb[i]);
+                    out.push(self.mk_not(xor));
+                }
+                out
+            }
+            BvTerm::Nor(a, b) => {
+                let va = self.emit_bits(a);
+                let vb = self.emit_bits(b);
+                assert_eq!(va.len(), vb.len());
+                let mut out = Vec::with_capacity(va.len());
+                for i in 0..va.len() {
+                    // NOR is NOT(OR)
+                    let or = self.mk_or(&[va[i], vb[i]]);
+                    out.push(self.mk_not(or));
                 }
                 out
             }
@@ -775,6 +1015,9 @@ impl BitBlaster {
             }
             BvTerm::Udiv(a, b) => { let va = self.emit_bits(a); let vb = self.emit_bits(b); let (q, _r) = self.udiv_urem_bits(&va, &vb); q }
             BvTerm::Urem(a, b) => { let va = self.emit_bits(a); let vb = self.emit_bits(b); let (_q, r) = self.udiv_urem_bits(&va, &vb); r }
+            BvTerm::Sdiv(a, b) => { let va = self.emit_bits(a); let vb = self.emit_bits(b); self.sdiv_bits(&va, &vb) }
+            BvTerm::Srem(a, b) => { let va = self.emit_bits(a); let vb = self.emit_bits(b); self.srem_bits(&va, &vb) }
+            BvTerm::Smod(a, b) => { let va = self.emit_bits(a); let vb = self.emit_bits(b); self.smod_bits(&va, &vb) }
             BvTerm::Concat(a, b) => {
                 let va = self.emit_bits(a);
                 let vb = self.emit_bits(b);
@@ -815,7 +1058,24 @@ impl BitBlaster {
                 for _ in 0..*times { for &l in &va { out.push(self.alias_bit(l)); } }
                 out
             }
-            BvTerm::Ite(c, t, e) => { let vc = self.emit_bits(c); assert_eq!(vc.len(), 1); let vt = self.emit_bits(t); let ve = self.emit_bits(e); assert_eq!(vt.len(), ve.len()); let mut out = Vec::with_capacity(vt.len()); for i in 0..vt.len() { out.push(self.ite_bit(vc[0], vt[i], ve[i])); } out }
+            BvTerm::Ite(c, t, e) => {
+                // Constant-fold on boolean condition when available
+                if let BvTerm::Value { bits } = &**c {
+                    let choose_then = bits.get(0).copied().unwrap_or(false);
+                    let vv = if choose_then { self.emit_bits(t) } else { self.emit_bits(e) };
+                    let mut out = Vec::with_capacity(vv.len());
+                    for &l in &vv { out.push(self.alias_bit(l)); }
+                    return out;
+                }
+                let vc = self.emit_bits(c);
+                assert_eq!(vc.len(), 1);
+                let vt = self.emit_bits(t);
+                let ve = self.emit_bits(e);
+                assert_eq!(vt.len(), ve.len());
+                let mut out = Vec::with_capacity(vt.len());
+                for i in 0..vt.len() { out.push(self.ite_bit(vc[0], vt[i], ve[i])); }
+                out
+            }
             BvTerm::Eq(a, b) => vec![self.bool_eq(a, b)],
             BvTerm::Ult(a, b) => vec![self.emit_ult_bool(a, b)],
             BvTerm::Ule(a, b) => vec![self.emit_ule_bool(a, b)],
@@ -824,6 +1084,170 @@ impl BitBlaster {
                 // a <= b (signed)  <=>  !(b < a) (signed)
                 let lt = self.emit_slt_bool(b, a);
                 vec![self.mk_not(lt)]
+            }
+            BvTerm::Uaddo(a, b) => {
+                let va = self.emit_bits(a);
+                let vb = self.emit_bits(b);
+                let w = va.len();
+                assert_eq!(w, vb.len());
+                
+                // Compute addition with carry
+                let mut carry = self.const_lit(false);
+                for i in 0..w {
+                    let axb = self.encode_xor_var(va[i], vb[i]);
+                    let carry1 = self.mk_and(&[va[i], vb[i]]);
+                    let carry2 = self.mk_and(&[carry, axb]);
+                    carry = self.mk_or(&[carry1, carry2]);
+                }
+                vec![carry] // overflow if final carry is 1
+            }
+            BvTerm::Saddo(a, b) => {
+                let va = self.emit_bits(a);
+                let vb = self.emit_bits(b);
+                let w = va.len();
+                assert_eq!(w, vb.len());
+                
+                let a_sign = va[w - 1];
+                let b_sign = vb[w - 1];
+                
+                // Compute result
+                let result = self.add_bits(&va, &vb);
+                let result_sign = result[w - 1];
+                
+                // Overflow if signs are same but result sign differs
+                let sign_xor = self.encode_xor_var(a_sign, b_sign);
+                let same_sign = self.mk_not(sign_xor);
+                let sign_diff = self.encode_xor_var(a_sign, result_sign);
+                vec![self.mk_and(&[same_sign, sign_diff])]
+            }
+            BvTerm::Usubo(a, b) => {
+                // Unsigned subtraction overflow: a < b
+                vec![self.emit_ult_bool(a, b)]
+            }
+            BvTerm::Ssubo(a, b) => {
+                let va = self.emit_bits(a);
+                let vb = self.emit_bits(b);
+                let w = va.len();
+                assert_eq!(w, vb.len());
+                
+                let a_sign = va[w - 1];
+                let b_sign = vb[w - 1];
+                
+                // Compute result  
+                let result = self.sub_bits(&va, &vb);
+                let result_sign = result[w - 1];
+                
+                // Overflow if signs differ and result sign != a sign
+                let diff_sign = self.encode_xor_var(a_sign, b_sign);
+                let sign_change = self.encode_xor_var(a_sign, result_sign);
+                vec![self.mk_and(&[diff_sign, sign_change])]
+            }
+            BvTerm::Umulo(a, b) => {
+                let va = self.emit_bits(a);
+                let vb = self.emit_bits(b);
+                let w = va.len();
+                assert_eq!(w, vb.len());
+                
+                // For unsigned multiplication overflow, we need to check if any
+                // bit in the upper half of the 2w-bit result is set
+                let z = self.const_lit(false);
+                let mut acc: Vec<BoolLit> = vec![z; 2 * w]; // 2w bits
+                
+                for i in 0..w {
+                    let mut shifted: Vec<BoolLit> = vec![z; 2 * w];
+                    for j in 0..w {
+                        if i + j < 2 * w {
+                            shifted[i + j] = va[j];
+                        }
+                    }
+                    let mut pp = Vec::with_capacity(2 * w);
+                    for j in 0..2 * w { 
+                        pp.push(self.ite_bit(vb[i], shifted[j], z)); 
+                    }
+                    acc = self.add_bits_extended(&acc, &pp);
+                }
+                
+                // Check if any upper bits are set
+                let mut overflow_terms = Vec::with_capacity(w);
+                for i in w..2*w {
+                    overflow_terms.push(acc[i]);
+                }
+                vec![self.mk_or(&overflow_terms)]
+            }
+            BvTerm::Smulo(a, b) => {
+                // For signed multiplication overflow, use a simplified approach
+                let va = self.emit_bits(a);
+                let vb = self.emit_bits(b);
+                let w = va.len();
+                
+                // Get absolute values  
+                let a_abs = self.abs_bits(&va);
+                let b_abs = self.abs_bits(&vb);
+                
+                // Do unsigned multiplication of absolute values with extended precision
+                let z = self.const_lit(false);
+                let mut acc: Vec<BoolLit> = vec![z; 2 * w];
+                
+                for i in 0..w {
+                    let mut shifted: Vec<BoolLit> = vec![z; 2 * w];
+                    for j in 0..w {
+                        if i + j < 2 * w {
+                            shifted[i + j] = a_abs[j];
+                        }
+                    }
+                    let mut pp = Vec::with_capacity(2 * w);
+                    for j in 0..2 * w { 
+                        pp.push(self.ite_bit(b_abs[i], shifted[j], z)); 
+                    }
+                    acc = self.add_bits_extended(&acc, &pp);
+                }
+                
+                // Check if result exceeds signed range [-(2^(w-1)), 2^(w-1)-1]
+                // This happens if any of the upper w bits are set, or if bit w-1 is set
+                // in the lower w bits (indicating >= 2^(w-1))
+                let mut overflow_terms = Vec::with_capacity(w + 1);
+                for i in w..2*w {
+                    overflow_terms.push(acc[i]);
+                }
+                overflow_terms.push(acc[w - 1]); // MSB of lower half
+                
+                vec![self.mk_or(&overflow_terms)]
+            }
+            BvTerm::Sdivo(a, b) => {
+                let va = self.emit_bits(a);
+                let vb = self.emit_bits(b);
+                let w = va.len();
+                
+                // Signed division overflow occurs when dividing MIN_INT by -1
+                // MIN_INT = 100...0, -1 = 111...1
+                let a_is_min = {
+                    let mut terms = vec![va[w - 1]]; // MSB must be 1
+                    for i in 0..w-1 {
+                        terms.push(self.mk_not(va[i])); // other bits must be 0
+                    }
+                    self.mk_and(&terms)
+                };
+                
+                let b_is_neg_one = {
+                    let mut terms = Vec::with_capacity(w);
+                    for i in 0..w {
+                        terms.push(vb[i]); // all bits must be 1
+                    }
+                    self.mk_and(&terms)
+                };
+                
+                vec![self.mk_and(&[a_is_min, b_is_neg_one])]
+            }
+            BvTerm::Nego(a) => {
+                let va = self.emit_bits(a);
+                let w = va.len();
+                
+                // Negation overflow occurs when negating MIN_INT (100...0)
+                let mut terms = vec![va[w - 1]]; // MSB must be 1
+                for i in 0..w-1 {
+                    terms.push(self.mk_not(va[i])); // other bits must be 0
+                }
+                vec![self.mk_and(&terms)]
             }
         }
     }
