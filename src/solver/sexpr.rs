@@ -75,6 +75,21 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_atom(&mut self) -> Result<SExpr> {
+        // FIXME: this is not elegant
+        if self.peek() == Some('|') {
+            // Quoted symbol: read everything until the next '|'
+            assert_eq!(self.bump(), Some('|'));
+            let mut s = String::new();
+            while let Some(c) = self.peek() {
+                if c == '|' {
+                    self.bump();
+                    break;
+                }
+                s.push(c);
+                self.bump();
+            }
+            return Ok(SExpr::Atom(s));
+        }
         let mut s = String::new();
         while let Some(c) = self.peek() {
             if c.is_whitespace() || c == '(' || c == ')' { break; }

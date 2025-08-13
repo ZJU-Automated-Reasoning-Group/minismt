@@ -54,6 +54,7 @@ pub enum Command {
     DeclareConst(String, SortBv), Assert(SExpr), CheckSat, GetModel,
     Push(u32), Pop(u32), GetValue(Vec<String>), Reset, ResetAssertions, Exit,
     DefineFun0(String, SortBv, SExpr),
+    DefineFun(String, Vec<String>, SExpr),
     GetInfo(String), GetOption(String),
     CheckSatAssuming(Vec<SExpr>),
 }
@@ -79,7 +80,7 @@ fn parse_command(e: &SExpr) -> Result<Command> {
         "get-info" => { if list.len() < 2 { bail!("insufficient args for get-info") }; Ok(Command::GetInfo(atom(&list[1])?)) }
         "get-option" => { if list.len() < 2 { bail!("insufficient args for get-option") }; Ok(Command::GetOption(atom(&list[1])?)) }
         "declare-fun" | "declare-const" => {
-            let name = atom(&list[1])?;
+            let name = normalize_ident(&atom(&list[1])?);
             let sort = if head == "declare-fun" {
                 let SExpr::List(args) = &list[2] else { bail!("declare-fun needs args list") };
                 if !args.is_empty() { bail!("only zero-arity declare-fun supported") };
@@ -90,11 +91,24 @@ fn parse_command(e: &SExpr) -> Result<Command> {
             Ok(Command::DeclareConst(name, sort))
         }
         "define-fun" => {
-            let name = atom(&list[1])?;
+            let name = normalize_ident(&atom(&list[1])?);
             let SExpr::List(args) = &list[2] else { bail!("define-fun needs args list") };
-            if !args.is_empty() { bail!("only zero-arity define-fun supported") };
-            let sort = parse_sort(&list[3])?;
-            Ok(Command::DefineFun0(name, sort, list[4].clone()))
+            if args.is_empty() {
+                let sort = parse_sort(&list[3])?;
+                Ok(Command::DefineFun0(name, sort, list[4].clone()))
+            } else {
+                // Support function macros by storing argument names and body; sorts are ignored
+                let mut arg_names: Vec<String> = Vec::new();
+                for a in args {
+                    if let SExpr::List(pair) = a {
+                        let pname = atom(&pair[0])?;
+                        let _psort = &pair[1]; // ignore
+                        arg_names.push(pname);
+                    } else { bail!("malformed define-fun arg") }
+                }
+                // let _ret_sort = parse_sort(&list[3])?; // ignore return sort
+                Ok(Command::DefineFun(name, arg_names, list[4].clone()))
+            }
         }
         "push" | "pop" => {
             let n = atom(&list[1])?.parse::<u32>()?;
@@ -124,9 +138,9 @@ fn parse_command(e: &SExpr) -> Result<Command> {
     }
 }
 
-fn atom(e: &SExpr) -> Result<String> {
-    match e { SExpr::Atom(s) => Ok(s.clone()), _ => bail!("expected atom") }
-}
+fn atom(e: &SExpr) -> Result<String> { match e { SExpr::Atom(s) => Ok(s.clone()), _ => bail!("expected atom") } }
+
+fn dequote_ident(s: &str) -> Option<String> { s.strip_prefix('|').and_then(|t| t.strip_suffix('|')).map(|t| t.to_string()) }
 
 fn parse_sort(e: &SExpr) -> Result<SortBv> {
     match e {
@@ -164,7 +178,24 @@ fn parse_term_with_env(e: &SExpr, vars: &HashMap<String, SortBv>) -> Result<BvTe
     match e {
         SExpr::Atom(a) => {
             if a.starts_with("#") { return parse_bv_value(a); }
-            if let Some(sort) = vars.get(a) { return Ok(BvTerm::Const { name: a.clone(), sort: *sort }); }
+            // Accept boolean literals in term context as 1-bit vectors
+            if a == "true" { return Ok(BvTerm::Value { bits: vec![true] }); }
+            if a == "false" { return Ok(BvTerm::Value { bits: vec![false] }); }
+            // Resolve variable names with fallback between quoted/unquoted
+            if let Some(sort) = vars.get(a) {
+                return Ok(BvTerm::Const { name: a.clone(), sort: *sort });
+            }
+            if let Some(unq) = dequote_ident(a) {
+                if let Some(sort) = vars.get(&unq) {
+                    return Ok(BvTerm::Const { name: unq, sort: *sort });
+                }
+            } else {
+                // try quoted form
+                let quoted = format!("|{}|", a);
+                if let Some(sort) = vars.get(&quoted) {
+                    return Ok(BvTerm::Const { name: quoted, sort: *sort });
+                }
+            }
             bail!("unknown symbol {}", a)
         }
         SExpr::List(items) => {
@@ -215,6 +246,17 @@ fn parse_term_with_env(e: &SExpr, vars: &HashMap<String, SortBv>) -> Result<BvTe
             
             let head = atom(head)?;
             match head.as_str() {
+                "=>" => {
+                    // Treat boolean implication at term level as boolean condition
+                    // so it can appear under ite, not/and/or contexts if needed.
+                    let a = parse_boolean_condition(&items[1], vars)?;
+                    let b = parse_boolean_condition(&items[2], vars)?;
+                    Ok(BvTerm::Ite(
+                        Box::new(a),
+                        Box::new(b.clone()),
+                        Box::new(BvTerm::Not(Box::new(b)))
+                    ))
+                }
                 "let" => {
                     // Handle let bindings by expanding them recursively
                     expand_let_bindings(&items[1], &items[2], vars)
@@ -240,6 +282,7 @@ fn parse_term_with_env(e: &SExpr, vars: &HashMap<String, SortBv>) -> Result<BvTe
                 "bvxor" => Ok(BvTerm::Xor(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
                 "bvxnor" => Ok(BvTerm::Xnor(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
                 "bvnor" => Ok(BvTerm::Nor(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
+                "bvcomp" => Ok(BvTerm::Comp(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
                 "bvadd" => Ok(BvTerm::Add(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
                 "bvsub" => Ok(BvTerm::Sub(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
                 "bvmul" => Ok(BvTerm::Mul(Box::new(parse_term_with_env(&items[1], vars)?), Box::new(parse_term_with_env(&items[2], vars)?))),
@@ -441,6 +484,7 @@ pub struct Engine {
     last_bb: Option<BitBlaster>,
     last_model: Option<Vec<bool>>,
     frames: Vec<usize>,
+    fun_defs: HashMap<String, (Vec<String>, SExpr)>,
 }
 
 impl Engine {
@@ -482,12 +526,21 @@ impl Engine {
                 ]));
                 Ok(None)
             }
+            Command::DefineFun(name, args, body) => {
+                // Store as a macro: (define-fun name (args...) ...) => a fresh symbol plus axiom
+                // We encode as an uninterpreted 1-bit symbol if referenced in boolean context; for bv we rely on inlining.
+                // Since our parser does not expand calls yet, we at least keep a placeholder axiom asserting name = body when no args.
+                if args.is_empty() {
+                    self.assertions.push(SExpr::List(vec![SExpr::Atom("=".to_string()), SExpr::Atom(name), body]));
+                }
+                Ok(None)
+            }
             Command::DeclareConst(name, sort) => { self.vars.insert(name, sort); Ok(None) }
             Command::Assert(t) => { self.assertions.push(t); Ok(None) }
             Command::CheckSat => {
                 let mut bb = BitBlaster::new();
                 for asexpr in &self.assertions {
-                    let lit = build_bool(asexpr, &mut bb, &self.vars)?;
+                    let lit = build_bool(asexpr, &mut bb, &self.vars, &self.fun_defs)?;
                     bb.cnf.add_clause(vec![lit]);
                 }
                 // Force that every boolean symbol mentioned is materialized to the CNF
@@ -513,12 +566,12 @@ impl Engine {
                 let mut bb = BitBlaster::new();
                 // Add regular assertions
                 for asexpr in &self.assertions {
-                    let lit = build_bool(asexpr, &mut bb, &self.vars)?;
+                    let lit = build_bool(asexpr, &mut bb, &self.vars, &self.fun_defs)?;
                     bb.cnf.add_clause(vec![lit]);
                 }
                 // Add assumptions
                 for assumption in assumptions {
-                    let lit = build_bool(&assumption, &mut bb, &self.vars)?;
+                    let lit = build_bool(&assumption, &mut bb, &self.vars, &self.fun_defs)?;
                     bb.cnf.add_clause(vec![lit]);
                 }
                 // Force that every boolean symbol mentioned is materialized to the CNF
@@ -598,43 +651,45 @@ impl Engine {
     }
 }
 
-fn build_bool(e: &SExpr, bb: &mut BitBlaster, vars: &HashMap<String, SortBv>) -> Result<BoolLit> {
+fn build_bool(e: &SExpr, bb: &mut BitBlaster, vars: &HashMap<String, SortBv>, fun_defs: &HashMap<String, (Vec<String>, SExpr)>) -> Result<BoolLit> {
     match e {
         SExpr::List(list) if !list.is_empty() => {
             let h = atom(&list[0])?;
             match h.as_str() {
                 "let" => {
+                    // Boolean-level let: expand bindings by syntactic substitution into the body
                     let SExpr::List(binds) = &list[1] else { bail!("let needs bindings list") };
-                    let mut local = vars.clone();
-                    for b in binds { 
-                        if let SExpr::List(pair) = b { 
-                            let name = atom(&pair[0])?; 
-                            let val = parse_bv_simplified(&pair[1], &local)?; 
-                            if let Some(sort) = val.sort() { local.insert(name, sort); } 
-                        } 
+                    let mut substitutions: HashMap<String, SExpr> = HashMap::new();
+                    for b in binds {
+                        if let SExpr::List(pair) = b {
+                            let name = atom(&pair[0])?;
+                            let val_expr = pair[1].clone();
+                            substitutions.insert(name, val_expr);
+                        }
                     }
-                    build_bool(&list[2], bb, &local)
+                    let expanded_body = substitute_let_vars(&list[2], &substitutions);
+                    build_bool(&expanded_body, bb, vars, fun_defs)
                 }
                 "and" => {
                     let mut lits = Vec::new();
-                    for a in &list[1..] { lits.push(build_bool(a, bb, vars)?); }
+                    for a in &list[1..] { lits.push(build_bool(a, bb, vars, fun_defs)?); }
                     Ok(bb.mk_and(&lits))
                 }
                 "or" => {
                     let mut lits = Vec::new();
-                    for a in &list[1..] { lits.push(build_bool(a, bb, vars)?); }
+                    for a in &list[1..] { lits.push(build_bool(a, bb, vars, fun_defs)?); }
                     Ok(bb.mk_or(&lits))
                 }
                 "xor" => {
                     let mut lits = Vec::new();
-                    for a in &list[1..] { lits.push(build_bool(a, bb, vars)?); }
+                    for a in &list[1..] { lits.push(build_bool(a, bb, vars, fun_defs)?); }
                     if lits.is_empty() { return Ok(bb.new_bool()); }
                     let mut acc = lits[0];
                     for &l in &lits[1..] { acc = bb.encode_xor_var(acc, l); }
                     Ok(acc)
                 }
                 "not" => {
-                    let l = build_bool(&list[1], bb, vars)?;
+                    let l = build_bool(&list[1], bb, vars, fun_defs)?;
                     Ok(bb.mk_not(l))
                 }
                 "=" => {
@@ -706,8 +761,8 @@ fn build_bool(e: &SExpr, bb: &mut BitBlaster, vars: &HashMap<String, SortBv>) ->
                 }
                 "=>" => {
                     if list.len() == 3 {
-                        let a = build_bool(&list[1], bb, vars)?;
-                        let b = build_bool(&list[2], bb, vars)?;
+                        let a = build_bool(&list[1], bb, vars, fun_defs)?;
+                        let b = build_bool(&list[2], bb, vars, fun_defs)?;
                         Ok(bb.mk_implies(a, b))
                     } else {
                         bail!("=> needs exactly 2 arguments")
@@ -715,9 +770,9 @@ fn build_bool(e: &SExpr, bb: &mut BitBlaster, vars: &HashMap<String, SortBv>) ->
                 }
                 "ite" => {
                     if list.len() == 4 {
-                        let cond = build_bool(&list[1], bb, vars)?;
-                        let then_b = build_bool(&list[2], bb, vars)?;
-                        let else_b = build_bool(&list[3], bb, vars)?;
+                        let cond = build_bool(&list[1], bb, vars, fun_defs)?;
+                        let then_b = build_bool(&list[2], bb, vars, fun_defs)?;
+                        let else_b = build_bool(&list[3], bb, vars, fun_defs)?;
                         Ok(bb.ite_bit(cond, then_b, else_b))
                     } else {
                         bail!("ite needs exactly 3 arguments")

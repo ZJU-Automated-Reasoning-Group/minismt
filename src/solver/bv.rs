@@ -49,6 +49,7 @@ pub enum BvTerm {
     Xor(Box<BvTerm>, Box<BvTerm>),
     Xnor(Box<BvTerm>, Box<BvTerm>),  // bitwise exclusive NOR
     Nor(Box<BvTerm>, Box<BvTerm>),   // bitwise NOR
+    Comp(Box<BvTerm>, Box<BvTerm>),  // bvcomp: returns 1-bit vector (1 if equal else 0)
     Add(Box<BvTerm>, Box<BvTerm>),
     Sub(Box<BvTerm>, Box<BvTerm>),
     Mul(Box<BvTerm>, Box<BvTerm>),
@@ -120,6 +121,7 @@ impl BvTerm {
             | BvTerm::Sdiv(a, _)
             | BvTerm::Srem(a, _)
             | BvTerm::Smod(a, _) => a.sort(),
+            BvTerm::Comp(_, _) => Some(SortBv { width: 1 }),
             BvTerm::Eq(_, _) | BvTerm::Ult(_, _) | BvTerm::Ule(_, _) | BvTerm::Slt(_, _) | BvTerm::Sle(_, _) => None,
             // Overflow operations return 1-bit result  
             BvTerm::Uaddo(_, _) | BvTerm::Saddo(_, _) | BvTerm::Usubo(_, _) | BvTerm::Ssubo(_, _)
@@ -854,6 +856,10 @@ impl BitBlaster {
                     out.push(y);
                 }
                 out
+            }
+            BvTerm::Comp(a, b) => {
+                let eq = self.bool_eq(a, b);
+                vec![eq]
             }
             BvTerm::Nand(a, b) => {
                 let va = self.emit_bits(a);
