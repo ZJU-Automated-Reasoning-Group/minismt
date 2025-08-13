@@ -1,0 +1,6 @@
+(set-logic QF_BV)
+(declare-const s (_ BitVec 4))
+(declare-const t (_ BitVec 4))
+(assert (= (bvlshr (bvshl s #b001) #b010) t))
+(check-sat)
+(get-model)

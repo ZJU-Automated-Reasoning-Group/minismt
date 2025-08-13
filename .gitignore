@@ -1,0 +1,11 @@
+/target
+.DS_Store
+*.lock
+.venv
+*.json
+.gdb_history
+.z3-trace
+# Hides the generated content in subprojects
+subprojects/*
+!/subprojects/packagefiles
+!subprojects/*.wrap
