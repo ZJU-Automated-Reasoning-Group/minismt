@@ -313,12 +313,11 @@ impl BitBlaster {
                 let idx = i as usize;
                 let val = bits.get(idx).copied().unwrap_or(false);
                 let var = self.cnf.new_var();
-                // Enforce constant value, but expose a canonical positive literal for the bit
-                let enforce = BoolLit(var, val);
-                self.cnf.add_clause(vec![enforce]);
-                let repr = BoolLit(var, true);
-                self.const_bit_cache.insert(key, repr);
-                repr
+                // Enforce constant value and return that literal as representation
+                let lit = BoolLit(var, val);
+                self.cnf.add_clause(vec![lit]);
+                self.const_bit_cache.insert(key, lit);
+                lit
             }
             BvTerm::Const { name, sort } => {
                 let w = sort.width;
@@ -791,7 +790,7 @@ impl BitBlaster {
         match t {
             BvTerm::Value { bits } => {
                 trace!(width = bits.len(), "emit const bits");
-                // bits are LSB-first; materialize canonical positive literals and enforce values separately
+                // bits are LSB-first; enforce values and use the enforced literal as representation
                 let mut lits = Vec::with_capacity(bits.len());
                 for (idx, &b) in bits.iter().enumerate() {
                     // Use bit values as cache key instead of memory address
@@ -800,11 +799,9 @@ impl BitBlaster {
                         l
                     } else {
                         let var = self.cnf.new_var();
-                        // Enforce value
-                        let enforce = BoolLit(var, b);
-                        self.cnf.add_clause(vec![enforce]);
-                        // Expose positive literal as the bit representation
-                        let l = BoolLit(var, true);
+                        // Enforce value and use same literal as representation
+                        let l = BoolLit(var, b);
+                        self.cnf.add_clause(vec![l]);
                         self.const_bit_cache.insert(key, l);
                         l
                     };
