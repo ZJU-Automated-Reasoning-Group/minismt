@@ -176,7 +176,12 @@ def main() -> int:
                 results[rel] = {"error": str(e)}
     
     # Analyze results
+    # - inconsistent: both solvers return results but they differ (true inconsistency)
+    # - performance_issues: one solver succeeds while the other times out (performance difference)
+    # - z3_success_minismt_issue: Z3 succeeds but minismt has issues (minismt-specific problems)
+    # - skipped_both_issue: both solvers have issues (test file problems)
     inconsistent = []
+    performance_issues = []
     z3_success_minismt_issue = []
     skipped_both_issue = []
     
@@ -194,8 +199,24 @@ def main() -> int:
         if mini_analysis.has_issue and z3_analysis.has_issue:
             skipped_both_issue.append(rel)
         elif mini_analysis.result and z3_analysis.result and mini_analysis.result != z3_analysis.result:
+            # Both solvers returned results but they differ - this is true inconsistency
             inconsistent.append(rel)
+        elif (mini_analysis.result and not mini_analysis.has_issue and z3_analysis.has_issue and z3_analysis.issue_kind == "timeout") or \
+             (z3_analysis.result and not z3_analysis.has_issue and mini_analysis.has_issue and mini_analysis.issue_kind == "timeout"):
+            # One solver succeeded while the other timed out - this is a performance issue
+            performance_issues.append({
+                "file": rel,
+                "minismt_result": mini_analysis.result,
+                "minismt_has_issue": mini_analysis.has_issue,
+                "minismt_issue_kind": mini_analysis.issue_kind,
+                "minismt_issue_msg": mini_analysis.issue_msg,
+                "z3_result": z3_analysis.result,
+                "z3_has_issue": z3_analysis.has_issue,
+                "z3_issue_kind": z3_analysis.issue_kind,
+                "z3_issue_msg": z3_analysis.issue_msg,
+            })
         elif z3_analysis.result and not z3_analysis.has_issue and mini_analysis.has_issue:
+            # Z3 succeeded but minismt had an issue - this is a minismt-specific issue
             z3_success_minismt_issue.append({
                 "file": rel,
                 "minismt_issue_kind": mini_analysis.issue_kind or "issue",
@@ -207,9 +228,11 @@ def main() -> int:
         "total_files": len(smt2_files),
         "skipped_both_issue_count": len(skipped_both_issue),
         "inconsistent_count": len(inconsistent),
+        "performance_issues_count": len(performance_issues),
         "z3_success_minismt_issue_count": len(z3_success_minismt_issue),
         "skipped_both_issue": skipped_both_issue,
         "inconsistent": inconsistent,
+        "performance_issues": performance_issues,
         "z3_success_minismt_issue": z3_success_minismt_issue,
         "details": results,
     }
@@ -221,6 +244,7 @@ def main() -> int:
     print(f"\nTotal .smt2 files: {len(smt2_files)}")
     print(f"Skipped (both warning/error): {len(skipped_both_issue)}")
     print(f"Inconsistent results: {len(inconsistent)}")
+    print(f"Performance issues (one solver succeeded, other timed out): {len(performance_issues)}")
     print(f"Z3 success but minismt warning/error: {len(z3_success_minismt_issue)}")
     print(f"Report written to: {report_path}")
     

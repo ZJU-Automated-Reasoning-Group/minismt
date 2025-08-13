@@ -12,6 +12,7 @@ pub enum Command {
     DeclareConst(String, SortBv), Assert(SExpr), CheckSat, GetModel,
     Push(u32), Pop(u32), GetValue(Vec<String>), Reset, ResetAssertions, Exit,
     DefineFun0(String, SortBv, SExpr),
+    GetInfo(String), GetOption(String),
 }
 
 pub fn parse_script(input: &str) -> Result<Vec<Command>> {
@@ -24,14 +25,16 @@ fn parse_command(e: &SExpr) -> Result<Command> {
     
     let head = atom(&list[0])?;
     match head.as_str() {
-        "set-logic" | "set-option" | "set-info" => {
-            if list.len() < 3 { bail!("insufficient args for {}", head) };
-            Ok(match head.as_str() {
-                "set-logic" => Command::SetLogic(atom(&list[1])?),
-                "set-option" => Command::SetOption(atom(&list[1])?, atom(&list[2])?),
-                _ => Command::SetInfo(atom(&list[1])?, atom(&list[2])?),
-            })
+        "set-logic" => {
+            if list.len() < 2 { bail!("insufficient args for set-logic"); }
+            Ok(Command::SetLogic(atom(&list[1])?))
         }
+        "set-option" | "set-info" => {
+            if list.len() < 3 { bail!("insufficient args for {}", head) };
+            Ok(if head == "set-option" { Command::SetOption(atom(&list[1])?, atom(&list[2])?) } else { Command::SetInfo(atom(&list[1])?, atom(&list[2])?) })
+        }
+        "get-info" => { if list.len() < 2 { bail!("insufficient args for get-info") }; Ok(Command::GetInfo(atom(&list[1])?)) }
+        "get-option" => { if list.len() < 2 { bail!("insufficient args for get-option") }; Ok(Command::GetOption(atom(&list[1])?)) }
         "declare-fun" | "declare-const" => {
             let name = atom(&list[1])?;
             let sort = if head == "declare-fun" {
@@ -41,11 +44,7 @@ fn parse_command(e: &SExpr) -> Result<Command> {
             } else {
                 parse_sort(&list[2])?
             };
-            if sort.width == 0 { // Bool case
-                Ok(Command::SetInfo("decl-bool".to_string(), name))
-            } else {
-                Ok(Command::DeclareConst(name, sort))
-            }
+            Ok(Command::DeclareConst(name, sort))
         }
         "define-fun" => {
             let name = atom(&list[1])?;
@@ -82,12 +81,17 @@ fn atom(e: &SExpr) -> Result<String> {
 }
 
 fn parse_sort(e: &SExpr) -> Result<SortBv> {
-    let SExpr::List(items) = e else { bail!("unsupported sort") };
-    if items.len() == 3 && atom(&items[0])? == "_" && atom(&items[1])? == "BitVec" {
-        let w = atom(&items[2])?.parse::<u32>().context("width parse")?;
-        Ok(SortBv { width: w })
-    } else {
-        bail!("unsupported sort expression")
+    match e {
+        SExpr::Atom(a) if a == "Bool" => Ok(SortBv { width: 1 }),
+        SExpr::List(items) => {
+            if items.len() == 3 && atom(&items[0])? == "_" && atom(&items[1])? == "BitVec" {
+                let w = atom(&items[2])?.parse::<u32>().context("width parse")?;
+                Ok(SortBv { width: w })
+            } else {
+                bail!("unsupported sort expression")
+            }
+        }
+        _ => bail!("unsupported sort"),
     }
 }
 
@@ -261,19 +265,19 @@ fn parse_boolean_condition(e: &SExpr, vars: &HashMap<String, SortBv>) -> Result<
                         let mut conds: Vec<BvTerm> = Vec::new();
                         for i in 1..items.len() { conds.push(parse_term_with_env(&items[i], vars)?); }
                         if head == "and" {
-                            // Build nested ITEs for AND
-                            let mut res = conds.last().unwrap().clone();
-                            for c in conds.iter().rev().skip(1) {
-                                res = BvTerm::Ite(Box::new(c.clone()), Box::new(res), Box::new(BvTerm::Value { bits: vec![false] }));
+                            // res = fold: Ite(c_i, res, false) with res starting at true
+                            let mut res = BvTerm::Value { bits: vec![true] };
+                            for c in conds {
+                                res = BvTerm::Ite(Box::new(c), Box::new(res), Box::new(BvTerm::Value { bits: vec![false] }));
                             }
-                            Ok(conds[0].clone())
+                            Ok(res)
                         } else {
-                            // Build nested ITEs for OR
+                            // OR: res = fold: Ite(c_i, true, res) with res starting at false
                             let mut res = BvTerm::Value { bits: vec![false] };
-                            for c in conds.iter().rev() {
-                                res = BvTerm::Ite(Box::new(c.clone()), Box::new(BvTerm::Value { bits: vec![true] }), Box::new(res));
+                            for c in conds {
+                                res = BvTerm::Ite(Box::new(c), Box::new(BvTerm::Value { bits: vec![true] }), Box::new(res));
                             }
-                            Ok(conds[0].clone())
+                            Ok(res)
                         }
                     } else {
                         parse_term_with_env(e, vars)
@@ -310,11 +314,18 @@ fn parse_boolean_condition(e: &SExpr, vars: &HashMap<String, SortBv>) -> Result<
                 "not" => {
                     if items.len() == 2 {
                         let inner = parse_boolean_condition(&items[1], vars)?;
-                        // For not, we'll handle the negation in the ITE construction
-                        Ok(inner)
+                        Ok(BvTerm::Ite(Box::new(inner), Box::new(BvTerm::Value { bits: vec![false] }), Box::new(BvTerm::Value { bits: vec![true] })))
                     } else {
                         parse_term_with_env(e, vars)
                     }
+                }
+                "ite" => {
+                    if items.len() == 4 {
+                        let c = parse_boolean_condition(&items[1], vars)?;
+                        let t = parse_boolean_condition(&items[2], vars)?;
+                        let f = parse_boolean_condition(&items[3], vars)?;
+                        Ok(BvTerm::Ite(Box::new(c), Box::new(t), Box::new(f)))
+                    } else { parse_term_with_env(e, vars) }
                 }
                 _ => parse_term_with_env(e, vars),
             }
@@ -366,6 +377,8 @@ impl Engine {
                 Ok(None) 
             }
             Command::Exit => Ok(None),
+            Command::GetInfo(_) => Ok(None),
+            Command::GetOption(_) => Ok(None),
             Command::DefineFun0(name, sort, body) => {
                 self.vars.insert(name.clone(), sort);
                 self.assertions.push(SExpr::List(vec![
