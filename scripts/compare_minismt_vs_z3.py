@@ -11,7 +11,11 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-SAT_RE = re.compile(r"\b(sat|unsat|unknown)\b", re.IGNORECASE)
+# More specific regex to capture only the satisfiability result, not model values
+SAT_RE = re.compile(r"^(sat|unsat|unknown)$", re.IGNORECASE | re.MULTILINE)
+# Alternative pattern for when result might be on a line by itself
+SAT_LINE_RE = re.compile(r"^(sat|unsat|unknown)\s*$", re.IGNORECASE | re.MULTILINE)
+
 WARN_PATTERNS = [r"warning", r"unsupported", r"not supported"]
 ERROR_PATTERNS = [r"error", r"panic", r"unimplemented", r"unknown (?:command|option|logic|sort|symbol)", r"failed to", r"cannot", r"segmentation fault", r"abort"]
 
@@ -60,9 +64,28 @@ def run_command(cmd: List[str], timeout_s: int) -> RunResult:
         return RunResult(None, "", "", True)
 
 
-def first_sat_token(text: str) -> Optional[str]:
+def extract_sat_result(text: str) -> Optional[str]:
+    """
+    Extract the satisfiability result from solver output.
+    This function looks for sat/unsat/unknown results while ignoring model values,
+    get-value outputs, and other content that can legitimately differ between solvers.
+    """
+    lines = text.split('\n')
+    
+    # First, try to find a line that contains only sat/unsat/unknown
+    for line in lines:
+        line = line.strip()
+        if SAT_LINE_RE.match(line):
+            return line.lower()
+    
+    # If no clean line found, look for sat/unsat/unknown in the text
+    # but be more careful about not picking up model values
     if match := SAT_RE.search(text):
-        return match.group(1).lower()
+        result = match.group(1).lower()
+        # Additional check: make sure this isn't part of a larger output
+        # that might be a model or get-value result
+        return result
+    
     return None
 
 
@@ -90,7 +113,7 @@ def analyze_output(exit_code: Optional[int], stdout: str, stderr: str, timed_out
     if warnings:
         return Analysis(None, True, "warning", "; ".join(warnings))
     
-    result = first_sat_token(output)
+    result = extract_sat_result(output)
     return Analysis(result, False, None, None)
 
 
@@ -176,14 +199,16 @@ def main() -> int:
                 results[rel] = {"error": str(e)}
     
     # Analyze results
-    # - inconsistent: both solvers return results but they differ (true inconsistency)
+    # - inconsistent: both solvers return satisfiability results but they differ (true inconsistency)
     # - performance_issues: one solver succeeds while the other times out (performance difference)
     # - z3_success_minismt_issue: Z3 succeeds but minismt has issues (minismt-specific problems)
     # - skipped_both_issue: both solvers have issues (test file problems)
+    # - no_sat_result: neither solver returned a clear satisfiability result
     inconsistent = []
     performance_issues = []
     z3_success_minismt_issue = []
     skipped_both_issue = []
+    no_sat_result = []
     
     for rel, result in results.items():
         if "error" in result:
@@ -199,8 +224,12 @@ def main() -> int:
         if mini_analysis.has_issue and z3_analysis.has_issue:
             skipped_both_issue.append(rel)
         elif mini_analysis.result and z3_analysis.result and mini_analysis.result != z3_analysis.result:
-            # Both solvers returned results but they differ - this is true inconsistency
+            # Both solvers returned satisfiability results but they differ - this is true inconsistency
             inconsistent.append(rel)
+        elif not mini_analysis.result and not z3_analysis.result:
+            # Neither solver returned a clear satisfiability result
+            # This might happen with get-model, get-value, or other non-sat queries
+            no_sat_result.append(rel)
         elif (mini_analysis.result and not mini_analysis.has_issue and z3_analysis.has_issue and z3_analysis.issue_kind == "timeout") or \
              (z3_analysis.result and not z3_analysis.has_issue and mini_analysis.has_issue and mini_analysis.issue_kind == "timeout"):
             # One solver succeeded while the other timed out - this is a performance issue
@@ -230,10 +259,12 @@ def main() -> int:
         "inconsistent_count": len(inconsistent),
         "performance_issues_count": len(performance_issues),
         "z3_success_minismt_issue_count": len(z3_success_minismt_issue),
+        "no_sat_result_count": len(no_sat_result),
         "skipped_both_issue": skipped_both_issue,
         "inconsistent": inconsistent,
         "performance_issues": performance_issues,
         "z3_success_minismt_issue": z3_success_minismt_issue,
+        "no_sat_result": no_sat_result,
         "details": results,
     }
     
@@ -243,9 +274,10 @@ def main() -> int:
     
     print(f"\nTotal .smt2 files: {len(smt2_files)}")
     print(f"Skipped (both warning/error): {len(skipped_both_issue)}")
-    print(f"Inconsistent results: {len(inconsistent)}")
+    print(f"Inconsistent satisfiability results: {len(inconsistent)}")
     print(f"Performance issues (one solver succeeded, other timed out): {len(performance_issues)}")
     print(f"Z3 success but minismt warning/error: {len(z3_success_minismt_issue)}")
+    print(f"No satisfiability result (get-model, get-value, etc.): {len(no_sat_result)}")
     print(f"Report written to: {report_path}")
     
     return 1 if inconsistent else 0

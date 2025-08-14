@@ -336,6 +336,15 @@ impl BitBlaster {
     }
 
     pub fn bool_eq(&mut self, a: &BvTerm, b: &BvTerm) -> BoolLit {
+        // Constant folding: if both inputs are constants, compute the result directly
+        if let (BvTerm::Value { bits: bits_a }, BvTerm::Value { bits: bits_b }) = (a, b) {
+            if bits_a.len() != bits_b.len() {
+                return self.const_lit(false);
+            }
+            let is_equal = bits_a.iter().zip(bits_b.iter()).all(|(a, b)| a == b);
+            return self.const_lit(is_equal);
+        }
+        
         let va = self.emit_bits(a);
         let vb = self.emit_bits(b);
         assert_eq!(va.len(), vb.len());
@@ -425,6 +434,28 @@ impl BitBlaster {
     fn force_value(&mut self, lit: BoolLit, value: bool) -> BoolLit {
         if value { self.cnf.add_clause(vec![lit]); } else { self.cnf.add_clause(vec![BoolLit(lit.0, false)]); }
         BoolLit(lit.0, value)
+    }
+
+    /// Try to evaluate a boolean literal to a constant value if possible
+    /// This enables constant folding for ITE conditions
+    fn try_eval_bool_lit(&mut self, lit: BoolLit) -> Option<bool> {
+        // Check if this literal is already constrained to a specific value
+        // Look through existing clauses to see if we can determine the value
+        
+        // If the literal appears in a unit clause, we know its value
+        for clause in &self.cnf.clauses {
+            if clause.len() == 1 {
+                if clause[0] == lit {
+                    return Some(true);
+                } else if clause[0] == BoolLit(lit.0, !lit.1) {
+                    return Some(false);
+                }
+            }
+        }
+        
+        // Check if we have conflicting constraints that would make this unsatisfiable
+        // For now, return None to indicate we can't determine the value
+        None
     }
 
     fn msb_bits_to_u128(bits: &[bool]) -> u128 {
@@ -831,6 +862,17 @@ impl BitBlaster {
                 let va = self.emit_bits(a);
                 let mut out = Vec::with_capacity(va.len());
                 for i in 0..va.len() { out.push(self.alias_not_bit(va[i])); }
+                // Constant folding: if input is constant, compute the result directly
+                if let BvTerm::Value { bits } = &**a {
+                    let mut result_bits = Vec::with_capacity(bits.len());
+                    for i in 0..bits.len() {
+                        result_bits.push(!bits[i]);
+                    }
+                    // Force the computed values
+                    for i in 0..out.len() {
+                        out[i] = self.force_value(out[i], result_bits[i]);
+                    }
+                }
                 out
             }
             BvTerm::Neg(a) => {
@@ -845,7 +887,20 @@ impl BitBlaster {
                     return self.alloc_const_bits(&out_bits);
                 }
                 let va = self.emit_bits(a);
-                self.negate_bits(&va)
+                let mut out = self.negate_bits(&va);
+                // Constant folding: if input is constant, compute the result directly
+                if let BvTerm::Value { bits } = &**a {
+                    let w = bits.len();
+                    let mut n = 0u128;
+                    for i in 0..w { if bits[i] { n |= 1u128 << i; } }
+                    let mask: u128 = if w >= 128 { u128::MAX } else { (1u128 << w) - 1 };
+                    let neg = ((!n).wrapping_add(1)) & mask;
+                    // Force the computed values
+                    for i in 0..out.len() {
+                        out[i] = self.force_value(out[i], ((neg >> i) & 1) == 1);
+                    }
+                }
+                out
             }
             BvTerm::RedOr(a) => {
                 if let BvTerm::Value { bits } = &**a {
@@ -895,6 +950,17 @@ impl BitBlaster {
                     let y = self.mk_and(&[va[i], vb[i]]);
                     out.push(y);
                 }
+                // Constant folding: if both inputs are constants, compute the result directly
+                if let (BvTerm::Value { bits: ba }, BvTerm::Value { bits: bb }) = (&**a, &**b) {
+                    let mut result_bits = Vec::with_capacity(ba.len());
+                    for i in 0..ba.len() {
+                        result_bits.push(ba[i] & bb[i]);
+                    }
+                    // Force the computed values
+                    for i in 0..out.len() {
+                        out[i] = self.force_value(out[i], result_bits[i]);
+                    }
+                }
                 out
             }
             BvTerm::Comp(a, b) => {
@@ -922,6 +988,17 @@ impl BitBlaster {
                     let y = self.mk_or(&[va[i], vb[i]]);
                     out.push(y);
                 }
+                // Constant folding: if both inputs are constants, compute the result directly
+                if let (BvTerm::Value { bits: ba }, BvTerm::Value { bits: bb }) = (&**a, &**b) {
+                    let mut result_bits = Vec::with_capacity(ba.len());
+                    for i in 0..ba.len() {
+                        result_bits.push(ba[i] | bb[i]);
+                    }
+                    // Force the computed values
+                    for i in 0..out.len() {
+                        out[i] = self.force_value(out[i], result_bits[i]);
+                    }
+                }
                 out
             }
             BvTerm::Xor(a, b) => {
@@ -932,6 +1009,17 @@ impl BitBlaster {
                 for i in 0..va.len() {
                     let y = self.encode_xor_var(va[i], vb[i]);
                     out.push(y);
+                }
+                // Constant folding: if both inputs are constants, compute the result directly
+                if let (BvTerm::Value { bits: ba }, BvTerm::Value { bits: bb }) = (&**a, &**b) {
+                    let mut result_bits = Vec::with_capacity(ba.len());
+                    for i in 0..ba.len() {
+                        result_bits.push(ba[i] ^ bb[i]);
+                    }
+                    // Force the computed values
+                    for i in 0..out.len() {
+                        out[i] = self.force_value(out[i], result_bits[i]);
+                    }
                 }
                 out
             }
@@ -1113,8 +1201,19 @@ impl BitBlaster {
                     for &l in &vv { out.push(self.alias_bit(l)); }
                     return out;
                 }
+                
+                // Check if condition can be constant-folded after evaluation
                 let vc = self.emit_bits(c);
                 assert_eq!(vc.len(), 1);
+                
+                // Try to constant-fold the condition if it's a simple boolean operation
+                if let Some(cond_value) = self.try_eval_bool_lit(vc[0]) {
+                    let vv = if cond_value { self.emit_bits(t) } else { self.emit_bits(e) };
+                    let mut out = Vec::with_capacity(vv.len());
+                    for &l in &vv { out.push(self.alias_bit(l)); }
+                    return out;
+                }
+                
                 let vt = self.emit_bits(t);
                 let ve = self.emit_bits(e);
                 assert_eq!(vt.len(), ve.len());
@@ -1321,5 +1420,3 @@ impl BitBlaster {
         Ok(())
     }
 }
-
-

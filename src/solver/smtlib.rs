@@ -343,7 +343,7 @@ fn parse_term_with_env(e: &SExpr, vars: &HashMap<String, SortBv>) -> Result<BvTe
                 "bvsgt" => Ok(BvTerm::Slt(Box::new(parse_term_with_env(&items[2], vars)?), Box::new(parse_term_with_env(&items[1], vars)?))), // a > b <=> b < a
                 "bvsge" => Ok(BvTerm::Sle(Box::new(parse_term_with_env(&items[2], vars)?), Box::new(parse_term_with_env(&items[1], vars)?))), // a >= b <=> b <= a
                 "ite" => {
-                    let cond = parse_boolean_condition(&items[1], vars)?;
+                    let cond = parse_term_with_env(&items[1], vars)?;
                     let then_t = parse_term_with_env(&items[2], vars)?;
                     let else_t = parse_term_with_env(&items[3], vars)?;
                     Ok(BvTerm::Ite(Box::new(cond), Box::new(then_t), Box::new(else_t)))
@@ -606,7 +606,7 @@ impl Engine {
             Command::GetModel => {
                 if let (Some(model), Some(bb)) = (&self.last_model, &self.last_bb) {
                     let mut out = String::new();
-                    out.push_str("(model\n");
+                    out.push_str("(\n");
                     for (name, lit) in &bb.bool_syms {
                         let val = model[lit.0];
                         out.push_str(&format!("  (define-fun {} () Bool {})\n", name, if val { "true" } else { "false" }));
@@ -621,14 +621,13 @@ impl Engine {
                                 bits.push(false);
                             }
                         }
-                        let mut s = String::from("#b");
-                        for i in (0..bits.len()).rev() { s.push(if bits[i] { '1' } else { '0' }); }
-                        out.push_str(&format!("  (define-fun {} () (_ BitVec {}) {})\n", name, w, s));
+                        let hex_str = self.bits_to_hex(&bits);
+                        out.push_str(&format!("  (define-fun {} () (_ BitVec {}) {})\n", name, w, hex_str));
                     }
                     out.push_str(")\n");
                     Ok(Some(out))
                 } else {
-                    Ok(Some("(model)\n".to_string()))
+                    Ok(Some("()\n".to_string()))
                 }
             }
             Command::GetValue(vars) => {
@@ -646,11 +645,10 @@ impl Engine {
                                     bits.push(false);
                                 }
                             }
-                            let mut s = String::from("#b");
-                            for i in (0..bits.len()).rev() { s.push(if bits[i] { '1' } else { '0' }); }
-                            out.push_str(&format!("({} {})", name, s));
+                            let hex_str = self.bits_to_hex(&bits);
+                            out.push_str(&format!("({} {})", name, hex_str));
                         } else {
-                            out.push_str(&format!("({} #b0)", name));
+                            out.push_str(&format!("({} #x0)", name));
                         }
                     }
                     out.push_str(")\n");
@@ -658,6 +656,35 @@ impl Engine {
                 } else { Ok(Some("()\n".to_string())) }
             }
         }
+    }
+
+    fn bits_to_hex(&self, bits: &[bool]) -> String {
+        if bits.is_empty() {
+            return "#x0".to_string();
+        }
+        
+        // Convert bits to hexadecimal
+        let mut hex_chars = Vec::new();
+        let mut current_byte = 0u8;
+        let mut bit_count = 0;
+        
+        // Process bits from MSB to LSB (reverse order since bits are stored LSB first)
+        for (i, &bit) in bits.iter().enumerate().rev() {
+            if bit {
+                current_byte |= 1 << (3 - bit_count);
+            }
+            bit_count += 1;
+            
+            if bit_count == 4 || i == 0 {
+                hex_chars.push(format!("{:x}", current_byte));
+                current_byte = 0;
+                bit_count = 0;
+            }
+        }
+        
+        // Reverse to get correct order and join
+        hex_chars.reverse();
+        format!("#x{}", hex_chars.join(""))
     }
 }
 
