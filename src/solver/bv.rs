@@ -1,30 +1,4 @@
 use std::collections::HashMap;
-use tracing::{trace, debug};
-
-/// Boolean literal used in CNF clauses.
-/// The first field is the zero-based variable index, the second is the polarity (true = positive).
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct BoolLit(pub usize, pub bool);
-
-/// A simple CNF container holding clauses and the number of allocated variables.
-#[derive(Clone, Debug, Default)]
-pub struct Cnf {
-    pub clauses: Vec<Vec<BoolLit>>,
-    pub num_vars: usize,
-}
-
-impl Cnf {
-    pub fn new() -> Self { Self { clauses: Vec::new(), num_vars: 0 } }
-
-    pub fn add_clause<I>(&mut self, clause: I)
-    where
-        I: IntoIterator<Item = BoolLit>,
-    {
-        self.clauses.push(clause.into_iter().collect());
-    }
-
-    pub fn new_var(&mut self) -> usize { let idx = self.num_vars; self.num_vars += 1; idx }
-}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SortBv { pub width: u32 }
@@ -164,1259 +138,535 @@ impl BvTerm {
     }
 }
 
-/// Bit-blaster that translates bit-vector expressions to CNF over boolean variables.
-pub struct BitBlaster {
-    pub cnf: Cnf,
-    pub bool_syms: HashMap<String, BoolLit>,
-    pub var_bits: HashMap<(String, u32), BoolLit>,
-
-    const_true: Option<BoolLit>,
-    const_false: Option<BoolLit>,
-    const_bit_cache: HashMap<(Vec<bool>, u32), BoolLit>,
+/// Evaluates a BvTerm given a model (variable assignments).
+/// Returns the bit vector result as a Vec<bool>, or an error if evaluation fails.
+pub fn eval_term(term: &BvTerm, model: &HashMap<String, Vec<bool>>) -> anyhow::Result<Vec<bool>> {
+    use anyhow::bail;
+    
+    match term {
+        BvTerm::Value { bits } => Ok(bits.clone()),
+        BvTerm::Const { name, sort } => {
+            if let Some(bits) = model.get(name) {
+                if bits.len() == sort.width as usize {
+                    Ok(bits.clone())
+                } else {
+                    bail!("Model value for {} has wrong width: expected {}, got {}", name, sort.width, bits.len())
+                }
+            } else {
+                // If not in model, default to all zeros
+                Ok(vec![false; sort.width as usize])
+            }
+        }
+        BvTerm::Not(a) => {
+            let av = eval_term(a, model)?;
+            Ok(av.iter().map(|&b| !b).collect())
+        }
+        BvTerm::Neg(a) => {
+            let av = eval_term(a, model)?;
+            Ok(bv_neg(&av))
+        }
+        BvTerm::RedOr(a) => {
+            let av = eval_term(a, model)?;
+            Ok(vec![av.iter().any(|&b| b)])
+        }
+        BvTerm::RedAnd(a) => {
+            let av = eval_term(a, model)?;
+            Ok(vec![av.iter().all(|&b| b)])
+        }
+        BvTerm::RedXor(a) => {
+            let av = eval_term(a, model)?;
+            let count = av.iter().filter(|&&b| b).count();
+            Ok(vec![(count % 2) == 1])
+        }
+        BvTerm::And(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            if av.len() != bv.len() {
+                bail!("And operands have different widths");
+            }
+            Ok(av.iter().zip(bv.iter()).map(|(&x, &y)| x && y).collect())
+        }
+        BvTerm::Nand(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            if av.len() != bv.len() {
+                bail!("Nand operands have different widths");
+            }
+            Ok(av.iter().zip(bv.iter()).map(|(&x, &y)| !(x && y)).collect())
+        }
+        BvTerm::Or(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            if av.len() != bv.len() {
+                bail!("Or operands have different widths");
+            }
+            Ok(av.iter().zip(bv.iter()).map(|(&x, &y)| x || y).collect())
+        }
+        BvTerm::Xor(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            if av.len() != bv.len() {
+                bail!("Xor operands have different widths");
+            }
+            Ok(av.iter().zip(bv.iter()).map(|(&x, &y)| x != y).collect())
+        }
+        BvTerm::Xnor(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            if av.len() != bv.len() {
+                bail!("Xnor operands have different widths");
+            }
+            Ok(av.iter().zip(bv.iter()).map(|(&x, &y)| x == y).collect())
+        }
+        BvTerm::Nor(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            if av.len() != bv.len() {
+                bail!("Nor operands have different widths");
+            }
+            Ok(av.iter().zip(bv.iter()).map(|(&x, &y)| !(x || y)).collect())
+        }
+        BvTerm::Comp(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            Ok(vec![av == bv])
+        }
+        BvTerm::Add(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            Ok(bv_add(&av, &bv))
+        }
+        BvTerm::Sub(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            Ok(bv_sub(&av, &bv))
+        }
+        BvTerm::Mul(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            Ok(bv_mul(&av, &bv))
+        }
+        BvTerm::Shl(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            Ok(bv_shl(&av, &bv))
+        }
+        BvTerm::Lshr(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            Ok(bv_lshr(&av, &bv))
+        }
+        BvTerm::Ashr(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            Ok(bv_ashr(&av, &bv))
+        }
+        BvTerm::Udiv(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            Ok(bv_udiv(&av, &bv))
+        }
+        BvTerm::Urem(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            Ok(bv_urem(&av, &bv))
+        }
+        BvTerm::Sdiv(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            Ok(bv_sdiv(&av, &bv))
+        }
+        BvTerm::Srem(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            Ok(bv_srem(&av, &bv))
+        }
+        BvTerm::Smod(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            Ok(bv_smod(&av, &bv))
+        }
+        BvTerm::Concat(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            let mut result = bv.clone();
+            result.extend(av);
+            Ok(result)
+        }
+        BvTerm::Extract { hi, lo, a } => {
+            let av = eval_term(a, model)?;
+            let lo = *lo as usize;
+            let hi = *hi as usize;
+            if hi >= av.len() || lo > hi {
+                bail!("Extract out of bounds");
+            }
+            Ok(av[lo..=hi].to_vec())
+        }
+        BvTerm::SignExtend { a, extra } => {
+            let av = eval_term(a, model)?;
+            let sign_bit = av.last().copied().unwrap_or(false);
+            let mut result = av.clone();
+            result.extend(vec![sign_bit; *extra as usize]);
+            Ok(result)
+        }
+        BvTerm::RotateLeft { a, amount } => {
+            let av = eval_term(a, model)?;
+            let n = av.len();
+            if n == 0 { return Ok(av); }
+            let rot = (*amount as usize) % n;
+            let mut result = Vec::with_capacity(n);
+            result.extend(&av[rot..]);
+            result.extend(&av[..rot]);
+            Ok(result)
+        }
+        BvTerm::RotateRight { a, amount } => {
+            let av = eval_term(a, model)?;
+            let n = av.len();
+            if n == 0 { return Ok(av); }
+            let rot = (*amount as usize) % n;
+            let mut result = Vec::with_capacity(n);
+            result.extend(&av[n-rot..]);
+            result.extend(&av[..n-rot]);
+            Ok(result)
+        }
+        BvTerm::Repeat { a, times } => {
+            let av = eval_term(a, model)?;
+            let mut result = Vec::new();
+            for _ in 0..*times {
+                result.extend(av.iter());
+            }
+            Ok(result)
+        }
+        BvTerm::Ite(cond, then_val, else_val) => {
+            let cv = eval_term(cond, model)?;
+            let cond_true = cv.len() > 0 && cv[0];
+            if cond_true {
+                eval_term(then_val, model)
+            } else {
+                eval_term(else_val, model)
+            }
+        }
+        BvTerm::Eq(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            Ok(vec![av == bv])
+        }
+        BvTerm::Ult(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            Ok(vec![bv_ult(&av, &bv)])
+        }
+        BvTerm::Ule(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            Ok(vec![bv_ule(&av, &bv)])
+        }
+        BvTerm::Slt(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            Ok(vec![bv_slt(&av, &bv)])
+        }
+        BvTerm::Sle(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            Ok(vec![bv_sle(&av, &bv)])
+        }
+        BvTerm::Uaddo(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            Ok(vec![bv_uaddo(&av, &bv)])
+        }
+        BvTerm::Saddo(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            Ok(vec![bv_saddo(&av, &bv)])
+        }
+        BvTerm::Usubo(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            Ok(vec![bv_usubo(&av, &bv)])
+        }
+        BvTerm::Ssubo(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            Ok(vec![bv_ssubo(&av, &bv)])
+        }
+        BvTerm::Umulo(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            Ok(vec![bv_umulo(&av, &bv)])
+        }
+        BvTerm::Smulo(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            Ok(vec![bv_smulo(&av, &bv)])
+        }
+        BvTerm::Sdivo(a, b) => {
+            let av = eval_term(a, model)?;
+            let bv = eval_term(b, model)?;
+            Ok(vec![bv_sdivo(&av, &bv)])
+        }
+        BvTerm::Nego(a) => {
+            let av = eval_term(a, model)?;
+            Ok(vec![bv_nego(&av)])
+        }
+    }
 }
 
-impl BitBlaster {
-    pub fn new() -> Self {
-        let s = Self {
-            cnf: Cnf::new(),
-            bool_syms: HashMap::new(),
-            var_bits: HashMap::new(),
-            const_true: None,
-            const_false: None,
-            const_bit_cache: HashMap::new(),
-        };
-        debug!("BitBlaster::new");
-        s
+// Helper functions for bit-vector operations
+fn bv_neg(a: &[bool]) -> Vec<bool> {
+    let result = a.iter().map(|&b| !b).collect::<Vec<_>>();
+    let one = vec![true];
+    bv_add(&result, &one)
+}
+
+fn bv_add(a: &[bool], b: &[bool]) -> Vec<bool> {
+    let n = a.len().max(b.len());
+    let mut result = Vec::with_capacity(n);
+    let mut carry = false;
+    for i in 0..n {
+        let ai = a.get(i).copied().unwrap_or(false);
+        let bi = b.get(i).copied().unwrap_or(false);
+        let sum = ai ^ bi ^ carry;
+        carry = (ai && bi) || (ai && carry) || (bi && carry);
+        result.push(sum);
     }
+    result.truncate(n);
+    result
+}
 
-    pub fn new_bool(&mut self) -> BoolLit { BoolLit(self.cnf.new_var(), true) }
+fn bv_sub(a: &[bool], b: &[bool]) -> Vec<bool> {
+    bv_add(a, &bv_neg(b))
+}
 
-    pub fn new_bit(&mut self) -> BoolLit { self.new_bool() }
-
-    pub fn new_tmp(&mut self) -> BoolLit { self.new_bool() }
-
-    pub fn mk_not(&mut self, l: BoolLit) -> BoolLit { BoolLit(l.0, !l.1) }
-
-    pub fn mk_and(&mut self, lits: &[BoolLit]) -> BoolLit {
-        if lits.is_empty() { return self.const_lit(true); }
-        if lits.len() == 1 { return lits[0]; }
-        let y = self.new_bool();
-        // (!y ∨ l_i) for all i, and (y ∨ !l1 ∨ !l2 ∨ ...)
-        let not_y = self.mk_not(y);
-        for &li in lits {
-            self.cnf.add_clause(vec![not_y, li]);
-        }
-        let mut big = Vec::with_capacity(lits.len() + 1);
-        big.push(y);
-        for &li in lits {
-            let not_li = self.mk_not(li);
-            big.push(not_li);
-        }
-        self.cnf.add_clause(big);
-        y
-    }
-
-    pub fn mk_or(&mut self, lits: &[BoolLit]) -> BoolLit {
-        if lits.is_empty() { return self.const_lit(false); }
-        if lits.len() == 1 { return lits[0]; }
-        let y = self.new_bool();
-        // (y ∨ ¬l1 ∨ ¬l2 ∨ ...), and (¬y ∨ l_i) for all i
-        let mut big = Vec::with_capacity(lits.len() + 1);
-        big.push(y);
-        for &li in lits {
-            let not_li = self.mk_not(li);
-            big.push(not_li);
-        }
-        self.cnf.add_clause(big);
-        let not_y = self.mk_not(y);
-        for &li in lits {
-            self.cnf.add_clause(vec![not_y, li]);
-        }
-        y
-    }
-
-    pub fn encode_xor_var(&mut self, a: BoolLit, b: BoolLit) -> BoolLit {
-        let y = self.new_bool();
-        // y <-> a xor b
-        // (¬y ∨ ¬a ∨ ¬b) - when both inputs true, output false
-        // (¬y ∨ a ∨ b)    - when both inputs false, output false
-        // (y ∨ ¬a ∨ b)    - when a false and b true, output true
-        // (y ∨ a ∨ ¬b)    - when a true and b false, output true
-        let na = self.mk_not(a);
-        let nb = self.mk_not(b);
-        let ny = self.mk_not(y);
-        self.cnf.add_clause(vec![ny, na, nb]);
-        self.cnf.add_clause(vec![ny, a, b]);
-        self.cnf.add_clause(vec![y, na, b]);
-        self.cnf.add_clause(vec![y, a, nb]);
-        y
-    }
-
-    pub fn encode_xor(&mut self, out: BoolLit, a: BoolLit, b: BoolLit) {
-        // out <-> a xor b
-        let na = self.mk_not(a);
-        let nb = self.mk_not(b);
-        let no = self.mk_not(out);
-        self.cnf.add_clause(vec![out, a, b]);
-        self.cnf.add_clause(vec![out, na, nb]);
-        self.cnf.add_clause(vec![no, a, nb]);
-        self.cnf.add_clause(vec![no, na, b]);
-    }
-
-    pub fn get_bool_sym<S: Into<String>>(&mut self, name: S) -> BoolLit {
-        let key: String = name.into();
-        if let Some(&l) = self.bool_syms.get(&key) { return l; }
-        let l = self.new_bool();
-        self.bool_syms.insert(key, l);
-        l
-    }
-
-    pub fn lookup_bool_sym(&self, name: &str) -> Option<BoolLit> { self.bool_syms.get(name).copied() }
-
-    pub fn const_lit(&mut self, value: bool) -> BoolLit {
-        if value {
-            if let Some(l) = self.const_true { return l; }
-            let l = self.new_bool();
-            self.cnf.add_clause(vec![l]); // force true
-            self.const_true = Some(l);
-            l
-        } else {
-            if let Some(l) = self.const_false { return l; }
-            let l = self.new_bool();
-            self.cnf.add_clause(vec![BoolLit(l.0, false)]); // force false
-            self.const_false = Some(l);
-            l
+fn bv_mul(a: &[bool], b: &[bool]) -> Vec<bool> {
+    let n = a.len();
+    let mut result = vec![false; n];
+    for i in 0..n {
+        if b.get(i).copied().unwrap_or(false) {
+            let shifted = bv_shl(a, &to_bits(i as u128, n));
+            result = bv_add(&result, &shifted);
         }
     }
+    result.truncate(n);
+    result
+}
 
-    pub fn assert_true(&mut self, lit: BoolLit) { self.cnf.add_clause(vec![lit]); }
-
-    pub fn mk_implies(&mut self, a: BoolLit, b: BoolLit) -> BoolLit {
-        // a -> b is (¬a ∨ b)
-        let y = self.new_bool();
-        let na = self.mk_not(a);
-        // y <-> (¬a ∨ b)
-        // (y ∨ a) (y ∨ ¬b) (¬y ∨ ¬a ∨ b)
-        self.cnf.add_clause(vec![y, a]);
-        let nb = self.mk_not(b);
-        self.cnf.add_clause(vec![y, nb]);
-        let ny = self.mk_not(y);
-        self.cnf.add_clause(vec![ny, na, b]);
-        y
+fn bv_shl(a: &[bool], b: &[bool]) -> Vec<bool> {
+    let shift = from_bits(b);
+    let n = a.len();
+    if shift >= n as u128 {
+        return vec![false; n];
     }
+    let shift = shift as usize;
+    let mut result = vec![false; n];
+    for i in shift..n {
+        result[i] = a[i - shift];
+    }
+    result
+}
 
-    pub fn emit_bit(&mut self, t: &BvTerm, i: u32) -> BoolLit {
-        match t {
-            BvTerm::Value { bits } => {
-                let key = (bits.clone(), i);
-                if let Some(&lit) = self.const_bit_cache.get(&key) { return lit; }
-                let idx = i as usize;
-                let val = bits.get(idx).copied().unwrap_or(false);
-                let var = self.cnf.new_var();
-                // Enforce constant value and return that literal as representation
-                let lit = BoolLit(var, val);
-                self.cnf.add_clause(vec![lit]);
-                self.const_bit_cache.insert(key, lit);
-                lit
-            }
-            BvTerm::Const { name, sort } => {
-                let w = sort.width;
-                assert!(i < w);
-                let key = (name.clone(), i);
-                if let Some(&l) = self.var_bits.get(&key) { return l; }
-                let l = self.new_bool();
-                self.var_bits.insert(key, l);
-                l
-            }
-            _ => {
-                let bits = self.emit_bits(t);
-                bits[i as usize]
-            }
+fn bv_lshr(a: &[bool], b: &[bool]) -> Vec<bool> {
+    let shift = from_bits(b);
+    let n = a.len();
+    if shift >= n as u128 {
+        return vec![false; n];
+    }
+    let shift = shift as usize;
+    let mut result = vec![false; n];
+    for i in 0..(n - shift) {
+        result[i] = a[i + shift];
+    }
+    result
+}
+
+fn bv_ashr(a: &[bool], b: &[bool]) -> Vec<bool> {
+    let shift = from_bits(b);
+    let n = a.len();
+    let sign_bit = a.last().copied().unwrap_or(false);
+    if shift >= n as u128 {
+        return vec![sign_bit; n];
+    }
+    let shift = shift as usize;
+    let mut result = vec![false; n];
+    for i in 0..(n - shift) {
+        result[i] = a[i + shift];
+    }
+    for i in (n - shift)..n {
+        result[i] = sign_bit;
+    }
+    result
+}
+
+fn bv_udiv(a: &[bool], b: &[bool]) -> Vec<bool> {
+    let n = a.len();
+    let av = from_bits(a);
+    let bv = from_bits(b);
+    if bv == 0 {
+        return vec![true; n]; // division by zero: all 1s
+    }
+    to_bits(av / bv, n)
+}
+
+fn bv_urem(a: &[bool], b: &[bool]) -> Vec<bool> {
+    let n = a.len();
+    let av = from_bits(a);
+    let bv = from_bits(b);
+    if bv == 0 {
+        return a.to_vec(); // remainder by zero: return a
+    }
+    to_bits(av % bv, n)
+}
+
+fn bv_sdiv(a: &[bool], b: &[bool]) -> Vec<bool> {
+    let n = a.len();
+    let av = signed_from_bits(a);
+    let bv = signed_from_bits(b);
+    if bv == 0 {
+        return if av >= 0 { vec![true; n] } else { vec![false; n-1].into_iter().chain(vec![true]).collect() };
+    }
+    signed_to_bits(av / bv, n)
+}
+
+fn bv_srem(a: &[bool], b: &[bool]) -> Vec<bool> {
+    let n = a.len();
+    let av = signed_from_bits(a);
+    let bv = signed_from_bits(b);
+    if bv == 0 {
+        return a.to_vec();
+    }
+    signed_to_bits(av % bv, n)
+}
+
+fn bv_smod(a: &[bool], b: &[bool]) -> Vec<bool> {
+    let n = a.len();
+    let av = signed_from_bits(a);
+    let bv = signed_from_bits(b);
+    if bv == 0 {
+        return a.to_vec();
+    }
+    let rem = av % bv;
+    let result = if (rem < 0 && bv > 0) || (rem > 0 && bv < 0) {
+        rem + bv
+    } else {
+        rem
+    };
+    signed_to_bits(result, n)
+}
+
+fn bv_ult(a: &[bool], b: &[bool]) -> bool {
+    from_bits(a) < from_bits(b)
+}
+
+fn bv_ule(a: &[bool], b: &[bool]) -> bool {
+    from_bits(a) <= from_bits(b)
+}
+
+fn bv_slt(a: &[bool], b: &[bool]) -> bool {
+    signed_from_bits(a) < signed_from_bits(b)
+}
+
+fn bv_sle(a: &[bool], b: &[bool]) -> bool {
+    signed_from_bits(a) <= signed_from_bits(b)
+}
+
+fn bv_uaddo(a: &[bool], b: &[bool]) -> bool {
+    let n = a.len();
+    let av = from_bits(a);
+    let bv = from_bits(b);
+    let sum = av + bv;
+    sum >= (1 << n)
+}
+
+fn bv_saddo(a: &[bool], b: &[bool]) -> bool {
+    let n = a.len();
+    let av = signed_from_bits(a);
+    let bv = signed_from_bits(b);
+    let max_val = (1i128 << (n - 1)) - 1;
+    let min_val = -(1i128 << (n - 1));
+    let sum = av + bv;
+    sum > max_val || sum < min_val
+}
+
+fn bv_usubo(a: &[bool], b: &[bool]) -> bool {
+    from_bits(a) < from_bits(b)
+}
+
+fn bv_ssubo(a: &[bool], b: &[bool]) -> bool {
+    let n = a.len();
+    let av = signed_from_bits(a);
+    let bv = signed_from_bits(b);
+    let max_val = (1i128 << (n - 1)) - 1;
+    let min_val = -(1i128 << (n - 1));
+    let diff = av - bv;
+    diff > max_val || diff < min_val
+}
+
+fn bv_umulo(a: &[bool], b: &[bool]) -> bool {
+    let n = a.len();
+    let av = from_bits(a);
+    let bv = from_bits(b);
+    let prod = av * bv;
+    prod >= (1 << n)
+}
+
+fn bv_smulo(a: &[bool], b: &[bool]) -> bool {
+    let n = a.len();
+    let av = signed_from_bits(a);
+    let bv = signed_from_bits(b);
+    let max_val = (1i128 << (n - 1)) - 1;
+    let min_val = -(1i128 << (n - 1));
+    let prod = av * bv;
+    prod > max_val || prod < min_val
+}
+
+fn bv_sdivo(a: &[bool], b: &[bool]) -> bool {
+    let n = a.len();
+    let av = signed_from_bits(a);
+    let bv = signed_from_bits(b);
+    let min_val = -(1i128 << (n - 1));
+    av == min_val && bv == -1
+}
+
+fn bv_nego(a: &[bool]) -> bool {
+    let n = a.len();
+    let av = signed_from_bits(a);
+    let min_val = -(1i128 << (n - 1));
+    av == min_val
+}
+
+fn from_bits(bits: &[bool]) -> u128 {
+    let mut result = 0u128;
+    for (i, &bit) in bits.iter().enumerate() {
+        if bit {
+            result |= 1 << i;
         }
     }
+    result
+}
 
-    pub fn bool_eq(&mut self, a: &BvTerm, b: &BvTerm) -> BoolLit {
-        // Constant folding: if both inputs are constants, compute the result directly
-        if let (BvTerm::Value { bits: bits_a }, BvTerm::Value { bits: bits_b }) = (a, b) {
-            if bits_a.len() != bits_b.len() {
-                return self.const_lit(false);
-            }
-            let is_equal = bits_a.iter().zip(bits_b.iter()).all(|(a, b)| a == b);
-            return self.const_lit(is_equal);
-        }
-        
-        let va = self.emit_bits(a);
-        let vb = self.emit_bits(b);
-        assert_eq!(va.len(), vb.len());
-        let mut eq_bits: Vec<BoolLit> = Vec::with_capacity(va.len());
-        for (ai, bi) in va.into_iter().zip(vb.into_iter()) {
-            let xor = self.encode_xor_var(ai, bi);
-            eq_bits.push(self.mk_not(xor));
-        }
-        self.mk_and(&eq_bits)
+fn signed_from_bits(bits: &[bool]) -> i128 {
+    if bits.is_empty() { return 0; }
+    let n = bits.len();
+    let unsigned = from_bits(bits);
+    let sign_bit = bits[n - 1];
+    if sign_bit {
+        // Negative: compute two's complement
+        (unsigned as i128) - (1i128 << n)
+    } else {
+        unsigned as i128
     }
+}
 
-    pub fn emit_ult_bool(&mut self, a: &BvTerm, b: &BvTerm) -> BoolLit {
-        let va = self.emit_bits(a);
-        let vb = self.emit_bits(b);
-        assert_eq!(va.len(), vb.len());
-        let w = va.len();
-
-        // Compute prefix-equal and less-at-pos from MSB to LSB
-        let mut less_terms: Vec<BoolLit> = Vec::with_capacity(w);
-        let mut prefix_eq = self.const_lit(true);
-        for k in (0..w).rev() {
-            let ak = va[k];
-            let bk = vb[k];
-            // ak < bk at bit k is (!ak & bk)
-            let not_ak = self.mk_not(ak);
-            let ak_lt_bk = self.mk_and(&[not_ak, bk]);
-            let term = self.mk_and(&[prefix_eq, ak_lt_bk]);
-            less_terms.push(term);
-            // Update prefix_eq: prefix_eq & (ak == bk)
-            let x = self.encode_xor_var(ak, bk);
-            let eq = self.mk_not(x);
-            prefix_eq = self.mk_and(&[prefix_eq, eq]);
-        }
-        self.mk_or(&less_terms)
+fn to_bits(val: u128, width: usize) -> Vec<bool> {
+    let mut result = Vec::with_capacity(width);
+    for i in 0..width {
+        result.push(((val >> i) & 1) == 1);
     }
+    result
+}
 
-    pub fn emit_ule_bool(&mut self, a: &BvTerm, b: &BvTerm) -> BoolLit {
-        let lt = self.emit_ult_bool(a, b);
-        let eq = self.bool_eq(a, b);
-        self.mk_or(&[lt, eq])
-    }
-
-    pub fn emit_slt_bool(&mut self, a: &BvTerm, b: &BvTerm) -> BoolLit {
-        let va = self.emit_bits(a);
-        let vb = self.emit_bits(b);
-        assert_eq!(va.len(), vb.len());
-        let w = va.len();
-        let sa = va[w - 1];
-        let sb = vb[w - 1];
-        let sign_diff = self.encode_xor_var(sa, sb);
-        let case_sign = self.mk_and(&[sign_diff, sa]); // sa=1,sb=0 => a<b
-        let not_sd = self.mk_not(sign_diff);
-        let ult = self.emit_ult_bool(a, b);
-        let case_same = self.mk_and(&[not_sd, ult]);
-        self.mk_or(&[case_sign, case_same])
-    }
-
-    pub fn ite_bit(&mut self, c: BoolLit, t: BoolLit, e: BoolLit) -> BoolLit {
-        // y = (c & t) | (!c & e)
-        let a = self.mk_and(&[c, t]);
-        let not_c = self.mk_not(c);
-        let b = self.mk_and(&[not_c, e]);
-        self.mk_or(&[a, b])
-    }
-
-    fn alias_bit(&mut self, source: BoolLit) -> BoolLit {
-        let y = self.new_bool();
-        // y <-> source
-        let ny = self.mk_not(y);
-        self.cnf.add_clause(vec![ny, source]);
-        let ns = self.mk_not(source);
-        self.cnf.add_clause(vec![y, ns]);
-        // Preserve expected polarity based on source literal polarity for test expectations
-        BoolLit(y.0, source.1)
-    }
-
-    fn alias_not_bit(&mut self, source: BoolLit) -> BoolLit {
-        let y = self.new_bool();
-        // y <-> ¬source  ⇒ (y ∨ source) ∧ (¬y ∨ ¬source)
-        self.cnf.add_clause(vec![y, source]);
-        let ny = self.mk_not(y);
-        let ns = self.mk_not(source);
-        self.cnf.add_clause(vec![ny, ns]);
-        BoolLit(y.0, !source.1)
-    }
-
-    fn force_value(&mut self, lit: BoolLit, value: bool) -> BoolLit {
-        if value { self.cnf.add_clause(vec![lit]); } else { self.cnf.add_clause(vec![BoolLit(lit.0, false)]); }
-        BoolLit(lit.0, value)
-    }
-
-    /// Try to evaluate a boolean literal to a constant value if possible
-    /// This enables constant folding for ITE conditions
-    fn try_eval_bool_lit(&mut self, lit: BoolLit) -> Option<bool> {
-        // Check if this literal is already constrained to a specific value
-        // Look through existing clauses to see if we can determine the value
-        
-        // If the literal appears in a unit clause, we know its value
-        for clause in &self.cnf.clauses {
-            if clause.len() == 1 {
-                if clause[0] == lit {
-                    return Some(true);
-                } else if clause[0] == BoolLit(lit.0, !lit.1) {
-                    return Some(false);
-                }
-            }
-        }
-        
-        // Check if we have conflicting constraints that would make this unsatisfiable
-        // For now, return None to indicate we can't determine the value
-        None
-    }
-
-    fn msb_bits_to_u128(bits: &[bool]) -> u128 {
-        let mut n: u128 = 0;
-        for &b in bits { n = (n << 1) | (if b { 1 } else { 0 }); }
-        n
-    }
-
-    fn u128_to_lsb_bits(&mut self, n: u128, width: usize) -> Vec<bool> {
-        let mut out = vec![false; width];
-        for i in 0..width { out[i] = ((n >> i) & 1) == 1; }
-        out
-    }
-
-    fn add_bits(&mut self, a: &[BoolLit], b: &[BoolLit]) -> Vec<BoolLit> {
-        assert_eq!(a.len(), b.len());
-        let w = a.len();
-        let mut out = Vec::with_capacity(w);
-        let mut carry = self.const_lit(false);
-        for i in 0..w {
-            let axb = self.encode_xor_var(a[i], b[i]);
-            let sum = self.encode_xor_var(axb, carry);
-            let carry1 = self.mk_and(&[a[i], b[i]]);
-            let carry2 = self.mk_and(&[carry, axb]);
-            carry = self.mk_or(&[carry1, carry2]);
-            out.push(sum);
-        }
-        out
-    }
-
-    fn sub_bits(&mut self, a: &[BoolLit], b: &[BoolLit]) -> Vec<BoolLit> {
-        // a - b = a + (~b + 1)
-        let nb = self.negate_bits(b);
-        self.add_bits(a, &nb)
-    }
-
-    fn ult_bits(&mut self, a: &[BoolLit], b: &[BoolLit]) -> BoolLit {
-        assert_eq!(a.len(), b.len());
-        let w = a.len();
-        let mut less_terms: Vec<BoolLit> = Vec::with_capacity(w);
-        let mut prefix_eq = self.const_lit(true);
-        for k in (0..w).rev() {
-            let ak = a[k];
-            let bk = b[k];
-            let nak = self.mk_not(ak);
-            let ak_lt_bk = self.mk_and(&[nak, bk]);
-            let term = self.mk_and(&[prefix_eq, ak_lt_bk]);
-            less_terms.push(term);
-            let x = self.encode_xor_var(ak, bk);
-            let eq = self.mk_not(x);
-            prefix_eq = self.mk_and(&[prefix_eq, eq]);
-        }
-        self.mk_or(&less_terms)
-    }
-
-    fn ule_bits(&mut self, a: &[BoolLit], b: &[BoolLit]) -> BoolLit {
-        let lt = self.ult_bits(a, b);
-        // a <= b  <=>  !(b < a)
-        let lt_ba = self.ult_bits(b, a);
-        let n = self.mk_not(lt_ba);
-        // we can also do lt | eq, but this is fine
-        n
-    }
-
-    fn udiv_urem_bits(&mut self, a: &[BoolLit], b: &[BoolLit]) -> (Vec<BoolLit>, Vec<BoolLit>) {
-        let w = a.len();
-        assert_eq!(w, b.len());
-        // Handle b == 0 mask
-        let mut b_is_zero_terms: Vec<BoolLit> = Vec::with_capacity(w);
-        for &bi in b { b_is_zero_terms.push(self.mk_not(bi)); }
-        let b_is_zero = self.mk_and(&b_is_zero_terms);
-
-        // Initialize remainder r = 0
-        let mut r: Vec<BoolLit> = vec![self.const_lit(false); w];
-        let mut q: Vec<BoolLit> = vec![self.const_lit(false); w];
-
-        for i in (0..w).rev() {
-            // new_r = (r << 1) | a[i]
-            let mut new_r: Vec<BoolLit> = Vec::with_capacity(w);
-            new_r.push(a[i]);
-            for j in 0..(w - 1) { new_r.push(r[j]); }
-
-            // if new_r >= b: new_r = new_r - b; q[i] = 1 else q[i] = 0
-            let ge = self.ule_bits(b, &new_r); // b <= new_r
-            let diff = self.sub_bits(&new_r, b);
-            let mut sel_r: Vec<BoolLit> = Vec::with_capacity(w);
-            for j in 0..w { sel_r.push(self.ite_bit(ge, diff[j], new_r[j])); }
-            r = sel_r;
-            // set q[i]
-            q[i] = ge;
-        }
-
-        // Apply b==0 semantics (unsigned): q = all-ones, r = a
-        let mut q_final: Vec<BoolLit> = Vec::with_capacity(w);
-        let mut r_final: Vec<BoolLit> = Vec::with_capacity(w);
-        for i in 0..w {
-            let t = self.const_lit(true);
-            q_final.push(self.ite_bit(b_is_zero, t, q[i]));
-            r_final.push(self.ite_bit(b_is_zero, a[i], r[i]));
-        }
-
-        (q_final, r_final)
-    }
-
-    fn sdiv_bits(&mut self, a: &[BoolLit], b: &[BoolLit]) -> Vec<BoolLit> {
-        let w = a.len();
-        assert_eq!(w, b.len());
-        
-        // Get sign bits
-        let a_sign = a[w - 1];
-        let b_sign = b[w - 1];
-        
-        // b == 0 -> return -1 (all ones)
-        let b_is_zero = self.is_zero_bits(b);
-
-        // Compute absolute values
-        let a_abs = self.abs_bits(a);
-        let b_abs = self.abs_bits(b);
-        
-        // Unsigned division of absolute values
-        let (q_abs, _) = self.udiv_urem_bits(&a_abs, &b_abs);
-        
-        // Result sign: negative if signs differ
-        let result_sign = self.encode_xor_var(a_sign, b_sign);
-        
-        // Conditionally negate the result
-        let neg_q = self.negate_bits(&q_abs);
-        let mut result = Vec::with_capacity(w);
-        for i in 0..w {
-            let signed_q = self.ite_bit(result_sign, neg_q[i], q_abs[i]);
-            // if b == 0 then -1 else signed_q
-            let neg_one_bit = self.const_lit(true);
-            result.push(self.ite_bit(b_is_zero, neg_one_bit, signed_q));
-        }
-        
-        result
-    }
-
-    fn srem_bits(&mut self, a: &[BoolLit], b: &[BoolLit]) -> Vec<BoolLit> {
-        let w = a.len();
-        assert_eq!(w, b.len());
-        
-        // Get sign bits
-        let a_sign = a[w - 1];
-        
-        // b == 0 -> remainder = a
-        let b_is_zero = self.is_zero_bits(b);
-
-        // Compute absolute values
-        let a_abs = self.abs_bits(a);
-        let b_abs = self.abs_bits(b);
-        
-        // Unsigned remainder of absolute values
-        let (_, r_abs) = self.udiv_urem_bits(&a_abs, &b_abs);
-        
-        // Result has same sign as dividend (a)
-        let neg_r = self.negate_bits(&r_abs);
-        let mut result = Vec::with_capacity(w);
-        for i in 0..w {
-            let signed_r = self.ite_bit(a_sign, neg_r[i], r_abs[i]);
-            result.push(self.ite_bit(b_is_zero, a[i], signed_r));
-        }
-        
-        result
-    }
-
-    fn smod_bits(&mut self, a: &[BoolLit], b: &[BoolLit]) -> Vec<BoolLit> {
-        let w = a.len();
-        assert_eq!(w, b.len());
-        
-        // smod is different from srem:
-        // - srem has same sign as dividend
-        // - smod has same sign as divisor (and is always in range [0, |b|))
-        
-        // Get sign bits
-        let a_sign = a[w - 1];
-        let b_sign = b[w - 1];
-        
-        // b == 0 -> result = a
-        let b_is_zero = self.is_zero_bits(b);
-
-        // Compute absolute values
-        let a_abs = self.abs_bits(a);
-        let b_abs = self.abs_bits(b);
-        
-        // Unsigned remainder of absolute values
-        let (_, r_abs) = self.udiv_urem_bits(&a_abs, &b_abs);
-        
-        // If signs differ and remainder != 0, adjust: result = |b| - r_abs
-        let signs_differ = self.encode_xor_var(a_sign, b_sign);
-        let r_is_zero = self.is_zero_bits(&r_abs);
-        let not_r_is_zero = self.mk_not(r_is_zero);
-        let need_adjust = self.mk_and(&[signs_differ, not_r_is_zero]);
-        
-        let adjusted = self.sub_bits(&b_abs, &r_abs);
-        let mut unadjusted = Vec::with_capacity(w);
-        for i in 0..w {
-            unadjusted.push(self.ite_bit(need_adjust, adjusted[i], r_abs[i]));
-        }
-        
-        // Apply divisor's sign
-        let neg_result = self.negate_bits(&unadjusted);
-        let mut result = Vec::with_capacity(w);
-        for i in 0..w {
-            let signed_res = self.ite_bit(b_sign, neg_result[i], unadjusted[i]);
-            result.push(self.ite_bit(b_is_zero, a[i], signed_res));
-        }
-        
-        result
-    }
-
-    fn abs_bits(&mut self, a: &[BoolLit]) -> Vec<BoolLit> {
-        let w = a.len();
-        let sign = a[w - 1];
-        let neg_a = self.negate_bits(a);
-        let mut result = Vec::with_capacity(w);
-        for i in 0..w {
-            result.push(self.ite_bit(sign, neg_a[i], a[i]));
-        }
-        result
-    }
-
-    fn is_zero_bits(&mut self, a: &[BoolLit]) -> BoolLit {
-        let mut zero_terms = Vec::with_capacity(a.len());
-        for &bit in a {
-            zero_terms.push(self.mk_not(bit));
-        }
-        self.mk_and(&zero_terms)
-    }
-
-    fn add_bits_extended(&mut self, a: &[BoolLit], b: &[BoolLit]) -> Vec<BoolLit> {
-        assert_eq!(a.len(), b.len());
-        let w = a.len();
-        let mut out = Vec::with_capacity(w);
-        let mut carry = self.const_lit(false);
-        for i in 0..w {
-            let axb = self.encode_xor_var(a[i], b[i]);
-            let sum = self.encode_xor_var(axb, carry);
-            let carry1 = self.mk_and(&[a[i], b[i]]);
-            let carry2 = self.mk_and(&[carry, axb]);
-            carry = self.mk_or(&[carry1, carry2]);
-            out.push(sum);
-        }
-        out
-    }
-
-    fn negate_bits(&mut self, a: &[BoolLit]) -> Vec<BoolLit> {
-        let w = a.len();
-        // two's complement: ~a + 1
-        let mut out = Vec::with_capacity(w);
-        let mut carry = self.const_lit(true);
-        for i in 0..w {
-            let nai = self.mk_not(a[i]);
-            let sum = self.encode_xor_var(nai, carry);
-            let new_carry = self.mk_and(&[nai, carry]);
-            carry = new_carry;
-            out.push(sum);
-        }
-        out
-    }
-
-    fn mul_bits(&mut self, a: &[BoolLit], b: &[BoolLit]) -> Vec<BoolLit> {
-        assert_eq!(a.len(), b.len());
-        let w = a.len();
-        let z = self.const_lit(false);
-        let mut acc: Vec<BoolLit> = vec![z; w];
-        for i in 0..w {
-            // partial = if b[i] then (a << i) else 0
-            let mut shifted: Vec<BoolLit> = Vec::with_capacity(w);
-            for j in 0..w {
-                let src = if j >= i { a[j - i] } else { z };
-                shifted.push(src);
-            }
-            // acc = acc + ite(b[i], shifted, 0)
-            let mut pp = Vec::with_capacity(w);
-            for j in 0..w { pp.push(self.ite_bit(b[i], shifted[j], z)); }
-            acc = self.add_bits(&acc, &pp);
-        }
-        acc
-    }
-
-    fn var_shift_left(&mut self, bits: &[BoolLit], sh: &[BoolLit]) -> Vec<BoolLit> {
-        let w = bits.len();
-        let z = self.const_lit(false);
-        let mut cur = bits.to_vec();
-        let maxk = (w as f64).log2().ceil() as usize;
-        for i in 0..maxk {
-            if i >= sh.len() { break; }
-            let k = 1usize << i;
-            let mut shifted: Vec<BoolLit> = Vec::with_capacity(w);
-            for j in 0..w { shifted.push(if j >= k { cur[j - k] } else { z }); }
-            let mut next: Vec<BoolLit> = Vec::with_capacity(w);
-            for j in 0..w { next.push(self.ite_bit(sh[i], shifted[j], cur[j])); }
-            cur = next;
-        }
-
-        // If shift amount >= width, result must be all zeros
-        let limit_bits_bool = self.u128_to_lsb_bits((w - 1) as u128, sh.len());
-        let limit_bits = self.alloc_const_bits(&limit_bits_bool);
-        let is_valid = self.ule_bits(sh, &limit_bits);
-        let mut out: Vec<BoolLit> = Vec::with_capacity(w);
-        for j in 0..w { out.push(self.ite_bit(is_valid, cur[j], z)); }
-        out
-    }
-
-    fn var_shift_right_logical(&mut self, bits: &[BoolLit], sh: &[BoolLit]) -> Vec<BoolLit> {
-        let w = bits.len();
-        let z = self.const_lit(false);
-        let mut cur = bits.to_vec();
-        let maxk = (w as f64).log2().ceil() as usize;
-        for i in 0..maxk {
-            if i >= sh.len() { break; }
-            let k = 1usize << i;
-            let mut shifted: Vec<BoolLit> = Vec::with_capacity(w);
-            for j in 0..w { shifted.push(if j + k < w { cur[j + k] } else { z }); }
-            let mut next: Vec<BoolLit> = Vec::with_capacity(w);
-            for j in 0..w { next.push(self.ite_bit(sh[i], shifted[j], cur[j])); }
-            cur = next;
-        }
-
-        // If shift amount >= width, result must be all zeros
-        let limit_bits_bool = self.u128_to_lsb_bits((w - 1) as u128, sh.len());
-        let limit_bits = self.alloc_const_bits(&limit_bits_bool);
-        let is_valid = self.ule_bits(sh, &limit_bits);
-        let mut out: Vec<BoolLit> = Vec::with_capacity(w);
-        for j in 0..w { out.push(self.ite_bit(is_valid, cur[j], z)); }
-        out
-    }
-
-    fn var_shift_right_arith(&mut self, bits: &[BoolLit], sh: &[BoolLit]) -> Vec<BoolLit> {
-        let w = bits.len();
-        let sign = bits[w - 1];
-        let mut cur = bits.to_vec();
-        let maxk = (w as f64).log2().ceil() as usize;
-        for i in 0..maxk {
-            if i >= sh.len() { break; }
-            let k = 1usize << i;
-            let mut shifted: Vec<BoolLit> = Vec::with_capacity(w);
-            for j in 0..w { shifted.push(if j + k < w { cur[j + k] } else { sign }); }
-            let mut next: Vec<BoolLit> = Vec::with_capacity(w);
-            for j in 0..w { next.push(self.ite_bit(sh[i], shifted[j], cur[j])); }
-            cur = next;
-        }
-
-        // If shift amount >= width, result must be all sign bits
-        let limit_bits_bool = self.u128_to_lsb_bits((w - 1) as u128, sh.len());
-        let limit_bits = self.alloc_const_bits(&limit_bits_bool);
-        let is_valid = self.ule_bits(sh, &limit_bits);
-        let mut out: Vec<BoolLit> = Vec::with_capacity(w);
-        for j in 0..w { out.push(self.ite_bit(is_valid, cur[j], sign)); }
-        out
-    }
-
-    fn concat_bits(&mut self, a: &[BoolLit], b: &[BoolLit]) -> Vec<BoolLit> {
-        // LSB-first: result = low bits from b, then from a
-        let mut out = Vec::with_capacity(a.len() + b.len());
-        out.extend_from_slice(b);
-        out.extend_from_slice(a);
-        out
-    }
-
-    pub fn emit_bits(&mut self, t: &BvTerm) -> Vec<BoolLit> {
-        match t {
-            BvTerm::Value { bits } => {
-                trace!(width = bits.len(), "emit const bits");
-                // bits are LSB-first; enforce values and use the enforced literal as representation
-                let mut lits = Vec::with_capacity(bits.len());
-                for (idx, &b) in bits.iter().enumerate() {
-                    // Use bit values as cache key instead of memory address
-                    let key = (bits.clone(), idx as u32);
-                    let lit = if let Some(&l) = self.const_bit_cache.get(&key) {
-                        l
-                    } else {
-                        let var = self.cnf.new_var();
-                        // Enforce value and use same literal as representation
-                        let l = BoolLit(var, b);
-                        self.cnf.add_clause(vec![l]);
-                        self.const_bit_cache.insert(key, l);
-                        l
-                    };
-                    lits.push(lit);
-                }
-                lits
-            }
-            BvTerm::Const { name, sort } => {
-                // Materialize named variable bits and cache mapping for model
-                let w = sort.width as usize;
-                trace!(%name, width = w, "emit var bits");
-                let mut out = Vec::with_capacity(w);
-                for i in 0..w {
-                    let key = (name.clone(), i as u32);
-                    let lit = if let Some(&l) = self.var_bits.get(&key) {
-                        l
-                    } else {
-                        let l = self.new_bool();
-                        self.var_bits.insert(key, l);
-                        l
-                    };
-                    out.push(lit);
-                }
-                out
-            }
-            BvTerm::Not(a) => {
-                let va = self.emit_bits(a);
-                let mut out = Vec::with_capacity(va.len());
-                for i in 0..va.len() { out.push(self.alias_not_bit(va[i])); }
-                // Constant folding: if input is constant, compute the result directly
-                if let BvTerm::Value { bits } = &**a {
-                    let mut result_bits = Vec::with_capacity(bits.len());
-                    for i in 0..bits.len() {
-                        result_bits.push(!bits[i]);
-                    }
-                    // Force the computed values
-                    for i in 0..out.len() {
-                        out[i] = self.force_value(out[i], result_bits[i]);
-                    }
-                }
-                out
-            }
-            BvTerm::Neg(a) => {
-                if let BvTerm::Value { bits } = &**a {
-                    // bits are LSB-first representation
-                    let w = bits.len();
-                    let mut n = 0u128;
-                    for i in 0..w { if bits[i] { n |= 1u128 << i; } }
-                    let mask: u128 = if w >= 128 { u128::MAX } else { (1u128 << w) - 1 };
-                    let neg = ((!n).wrapping_add(1)) & mask;
-                    let out_bits = self.u128_to_lsb_bits(neg, w);
-                    return self.alloc_const_bits(&out_bits);
-                }
-                let va = self.emit_bits(a);
-                let mut out = self.negate_bits(&va);
-                // Constant folding: if input is constant, compute the result directly
-                if let BvTerm::Value { bits } = &**a {
-                    let w = bits.len();
-                    let mut n = 0u128;
-                    for i in 0..w { if bits[i] { n |= 1u128 << i; } }
-                    let mask: u128 = if w >= 128 { u128::MAX } else { (1u128 << w) - 1 };
-                    let neg = ((!n).wrapping_add(1)) & mask;
-                    // Force the computed values
-                    for i in 0..out.len() {
-                        out[i] = self.force_value(out[i], ((neg >> i) & 1) == 1);
-                    }
-                }
-                out
-            }
-            BvTerm::RedOr(a) => {
-                if let BvTerm::Value { bits } = &**a {
-                    // OR reduction: true if any bit is true
-                    let result = bits.iter().any(|&b| b);
-                    vec![self.const_lit(result)]
-                } else {
-                    let va = self.emit_bits(a);
-                    vec![self.mk_or(&va)]
-                }
-            }
-            BvTerm::RedAnd(a) => {
-                if let BvTerm::Value { bits } = &**a {
-                    // AND reduction: true if all bits are true
-                    let result = bits.iter().all(|&b| b);
-                    vec![self.const_lit(result)]
-                } else {
-                    let va = self.emit_bits(a);
-                    vec![self.mk_and(&va)]
-                }
-            }
-            BvTerm::RedXor(a) => {
-                if let BvTerm::Value { bits } = &**a {
-                    // XOR reduction: true if odd number of bits are true
-                    let count = bits.iter().filter(|&&b| b).count();
-                    let result = (count % 2) == 1;
-                    vec![self.const_lit(result)]
-                } else {
-                    let va = self.emit_bits(a);
-                    if va.is_empty() {
-                        vec![self.const_lit(false)]
-                    } else {
-                        let mut acc = va[0];
-                        for &bit in &va[1..] {
-                            acc = self.encode_xor_var(acc, bit);
-                        }
-                        vec![acc]
-                    }
-                }
-            }
-            BvTerm::And(a, b) => {
-                let va = self.emit_bits(a);
-                let vb = self.emit_bits(b);
-                assert_eq!(va.len(), vb.len());
-                let mut out = Vec::with_capacity(va.len());
-                for i in 0..va.len() {
-                    let y = self.mk_and(&[va[i], vb[i]]);
-                    out.push(y);
-                }
-                // Constant folding: if both inputs are constants, compute the result directly
-                if let (BvTerm::Value { bits: ba }, BvTerm::Value { bits: bb }) = (&**a, &**b) {
-                    let mut result_bits = Vec::with_capacity(ba.len());
-                    for i in 0..ba.len() {
-                        result_bits.push(ba[i] & bb[i]);
-                    }
-                    // Force the computed values
-                    for i in 0..out.len() {
-                        out[i] = self.force_value(out[i], result_bits[i]);
-                    }
-                }
-                out
-            }
-            BvTerm::Comp(a, b) => {
-                let eq = self.bool_eq(a, b);
-                vec![eq]
-            }
-            BvTerm::Nand(a, b) => {
-                let va = self.emit_bits(a);
-                let vb = self.emit_bits(b);
-                assert_eq!(va.len(), vb.len());
-                let mut out = Vec::with_capacity(va.len());
-                for i in 0..va.len() {
-                    let and_y = self.mk_and(&[va[i], vb[i]]);
-                    let y = self.mk_not(and_y);
-                    out.push(y);
-                }
-                out
-            }
-            BvTerm::Or(a, b) => {
-                let va = self.emit_bits(a);
-                let vb = self.emit_bits(b);
-                assert_eq!(va.len(), vb.len());
-                let mut out = Vec::with_capacity(va.len());
-                for i in 0..va.len() {
-                    let y = self.mk_or(&[va[i], vb[i]]);
-                    out.push(y);
-                }
-                // Constant folding: if both inputs are constants, compute the result directly
-                if let (BvTerm::Value { bits: ba }, BvTerm::Value { bits: bb }) = (&**a, &**b) {
-                    let mut result_bits = Vec::with_capacity(ba.len());
-                    for i in 0..ba.len() {
-                        result_bits.push(ba[i] | bb[i]);
-                    }
-                    // Force the computed values
-                    for i in 0..out.len() {
-                        out[i] = self.force_value(out[i], result_bits[i]);
-                    }
-                }
-                out
-            }
-            BvTerm::Xor(a, b) => {
-                let va = self.emit_bits(a);
-                let vb = self.emit_bits(b);
-                assert_eq!(va.len(), vb.len());
-                let mut out = Vec::with_capacity(va.len());
-                for i in 0..va.len() {
-                    let y = self.encode_xor_var(va[i], vb[i]);
-                    out.push(y);
-                }
-                // Constant folding: if both inputs are constants, compute the result directly
-                if let (BvTerm::Value { bits: ba }, BvTerm::Value { bits: bb }) = (&**a, &**b) {
-                    let mut result_bits = Vec::with_capacity(ba.len());
-                    for i in 0..ba.len() {
-                        result_bits.push(ba[i] ^ bb[i]);
-                    }
-                    // Force the computed values
-                    for i in 0..out.len() {
-                        out[i] = self.force_value(out[i], result_bits[i]);
-                    }
-                }
-                out
-            }
-            BvTerm::Xnor(a, b) => {
-                let va = self.emit_bits(a);
-                let vb = self.emit_bits(b);
-                assert_eq!(va.len(), vb.len());
-                let mut out = Vec::with_capacity(va.len());
-                for i in 0..va.len() {
-                    // XNOR is NOT(XOR)
-                    let xor = self.encode_xor_var(va[i], vb[i]);
-                    out.push(self.mk_not(xor));
-                }
-                out
-            }
-            BvTerm::Nor(a, b) => {
-                let va = self.emit_bits(a);
-                let vb = self.emit_bits(b);
-                assert_eq!(va.len(), vb.len());
-                let mut out = Vec::with_capacity(va.len());
-                for i in 0..va.len() {
-                    // NOR is NOT(OR)
-                    let or = self.mk_or(&[va[i], vb[i]]);
-                    out.push(self.mk_not(or));
-                }
-                out
-            }
-            BvTerm::Add(a, b) => {
-                let va = self.emit_bits(a);
-                let vb = self.emit_bits(b);
-                let mut out = self.add_bits(&va, &vb);
-                // Set expected polarity for constant inputs using current literal polarities
-                for i in 0..out.len() {
-                    // Compute half-adder addition from polarities for expected (approx ok for constant inputs)
-                    // For robustness, recompute via u128 if widths small
-                    let expected = va[i].1 ^ vb[i].1; // this ignores carries; adjust by simple ripple
-                }
-                if let (BvTerm::Value { bits: ba }, BvTerm::Value { bits: bb }) = (&**a, &**b) {
-                    let w = ba.len();
-                    let mut an: u128 = 0; for (i, &bt) in ba.iter().enumerate() { if bt { an |= 1u128 << i; } }
-                    let mut bn: u128 = 0; for (i, &bt) in bb.iter().enumerate() { if bt { bn |= 1u128 << i; } }
-                    let mask: u128 = if w >= 128 { u128::MAX } else { (1u128 << w) - 1 };
-                    let sn = (an + bn) & mask;
-                    for i in 0..w { out[i] = self.force_value(out[i], ((sn >> i) & 1) == 1); }
-                }
-                out
-            }
-            BvTerm::Sub(a, b) => {
-                let va = self.emit_bits(a);
-                let vb = self.emit_bits(b);
-                let mut out = self.sub_bits(&va, &vb);
-                if let (BvTerm::Value { bits: ba }, BvTerm::Value { bits: bb }) = (&**a, &**b) {
-                    let w = ba.len();
-                    let mut an: u128 = 0; for (i, &bt) in ba.iter().enumerate() { if bt { an |= 1u128 << i; } }
-                    let mut bn: u128 = 0; for (i, &bt) in bb.iter().enumerate() { if bt { bn |= 1u128 << i; } }
-                    let mask: u128 = if w >= 128 { u128::MAX } else { (1u128 << w) - 1 };
-                    let sn = (an.wrapping_sub(bn)) & mask;
-                    for i in 0..w { out[i] = self.force_value(out[i], ((sn >> i) & 1) == 1); }
-                }
-                out
-            }
-            BvTerm::Mul(a, b) => {
-                let va = self.emit_bits(a);
-                let vb = self.emit_bits(b);
-                let mut prod = self.mul_bits(&va, &vb);
-                if let (BvTerm::Value{bits:ba}, BvTerm::Value{bits:bb}) = (&**a, &**b) {
-                    let w = ba.len();
-                    // compute expected product
-                    let mut acc = vec![false; w];
-                    for i in 0..w {
-                        if bb[i] {
-                            let mut carry = false;
-                            for j in 0..w {
-                                let aj = if j >= i { ba[j - i] } else { false };
-                                let s = acc[j] ^ aj ^ carry;
-                                let c_out = (acc[j] & aj) | (carry & (acc[j] ^ aj));
-                                acc[j] = s; carry = c_out;
-                            }
-                        }
-                    }
-                    for i in 0..w { prod[i] = self.force_value(prod[i], acc[i]); }
-                }
-                prod
-            }
-            BvTerm::Shl(a, b) => {
-                if let BvTerm::Value { bits: sbits } = &**b {
-                    let w = a.sort().map(|s| s.width as usize).unwrap_or(0);
-                    let mut sh = 0usize; for (i, &bt) in sbits.iter().enumerate() { if bt { sh |= 1usize << i; } }
-                    let va = self.emit_bits(a);
-                    let mut out = Vec::with_capacity(w);
-                    for i in 0..w { out.push(if i >= sh { va[i - sh] } else { self.const_lit(false) }); }
-                    out
-                } else {
-                    let va = self.emit_bits(a);
-                    let vb = self.emit_bits(b);
-                    self.var_shift_left(&va, &vb)
-                }
-            }
-            BvTerm::Lshr(a, b) => {
-                if let BvTerm::Value { bits: sbits } = &**b {
-                    let w = a.sort().map(|s| s.width as usize).unwrap_or(0);
-                    let mut sh = 0usize; for (i, &bt) in sbits.iter().enumerate() { if bt { sh |= 1usize << i; } }
-                    let va = self.emit_bits(a);
-                    let mut out = Vec::with_capacity(w);
-                    for i in 0..w { out.push(if i + sh < w { va[i + sh] } else { self.const_lit(false) }); }
-                    out
-                } else {
-                    let va = self.emit_bits(a);
-                    let vb = self.emit_bits(b);
-                    self.var_shift_right_logical(&va, &vb)
-                }
-            }
-            BvTerm::Ashr(a, b) => {
-                if let BvTerm::Value { bits: sbits } = &**b {
-                    let w = a.sort().map(|s| s.width as usize).unwrap_or(0);
-                    let mut sh = 0usize; for (i, &bt) in sbits.iter().enumerate() { if bt { sh |= 1usize << i; } }
-                    let va = self.emit_bits(a);
-                    let sign = va[w - 1];
-                    let mut out = Vec::with_capacity(w);
-                    for i in 0..w { out.push(if i + sh < w { va[i + sh] } else { sign }); }
-                    out
-                } else {
-                    let va = self.emit_bits(a);
-                    let vb = self.emit_bits(b);
-                    self.var_shift_right_arith(&va, &vb)
-                }
-            }
-            BvTerm::Udiv(a, b) => { let va = self.emit_bits(a); let vb = self.emit_bits(b); let (q, _r) = self.udiv_urem_bits(&va, &vb); q }
-            BvTerm::Urem(a, b) => { let va = self.emit_bits(a); let vb = self.emit_bits(b); let (_q, r) = self.udiv_urem_bits(&va, &vb); r }
-            BvTerm::Sdiv(a, b) => { let va = self.emit_bits(a); let vb = self.emit_bits(b); self.sdiv_bits(&va, &vb) }
-            BvTerm::Srem(a, b) => { let va = self.emit_bits(a); let vb = self.emit_bits(b); self.srem_bits(&va, &vb) }
-            BvTerm::Smod(a, b) => { let va = self.emit_bits(a); let vb = self.emit_bits(b); self.smod_bits(&va, &vb) }
-            BvTerm::Concat(a, b) => {
-                let va = self.emit_bits(a);
-                let vb = self.emit_bits(b);
-                let mut out = Vec::with_capacity(va.len() + vb.len());
-                for &l in &vb { out.push(self.alias_bit(l)); }
-                for &l in &va { out.push(self.alias_bit(l)); }
-                out
-            }
-            BvTerm::Extract { hi, lo, a } => { let va = self.emit_bits(a); let mut out = Vec::with_capacity((*hi - *lo + 1) as usize); for i in *lo..=*hi { out.push(va[i as usize]); } out }
-            BvTerm::SignExtend { a, extra } => {
-                let va = self.emit_bits(a);
-                let w = va.len();
-                let sign = va[w - 1];
-                let mut out = Vec::with_capacity(w + (*extra as usize));
-                for &l in &va { out.push(self.alias_bit(l)); }
-                for _ in 0..*extra as usize { out.push(self.alias_bit(sign)); }
-                out
-            }
-            BvTerm::RotateLeft { a, amount } => {
-                let va = self.emit_bits(a);
-                let w = va.len();
-                let amt = (*amount as usize) % w;
-                let mut out = Vec::with_capacity(w);
-                for i in 0..w { let src = (i + w - amt) % w; out.push(self.alias_bit(va[src])); }
-                out
-            }
-            BvTerm::RotateRight { a, amount } => {
-                let va = self.emit_bits(a);
-                let w = va.len();
-                let amt = (*amount as usize) % w;
-                let mut out = Vec::with_capacity(w);
-                for i in 0..w { let src = (i + amt) % w; out.push(self.alias_bit(va[src])); }
-                out
-            }
-            BvTerm::Repeat { a, times } => {
-                let va = self.emit_bits(a);
-                let mut out = Vec::with_capacity(va.len() * (*times as usize));
-                for _ in 0..*times { for &l in &va { out.push(self.alias_bit(l)); } }
-                out
-            }
-            BvTerm::Ite(c, t, e) => {
-                // Constant-fold on boolean condition when available
-                if let BvTerm::Value { bits } = &**c {
-                    let choose_then = bits.get(0).copied().unwrap_or(false);
-                    let vv = if choose_then { self.emit_bits(t) } else { self.emit_bits(e) };
-                    let mut out = Vec::with_capacity(vv.len());
-                    for &l in &vv { out.push(self.alias_bit(l)); }
-                    return out;
-                }
-                
-                // Check if condition can be constant-folded after evaluation
-                let vc = self.emit_bits(c);
-                assert_eq!(vc.len(), 1);
-                
-                // Try to constant-fold the condition if it's a simple boolean operation
-                if let Some(cond_value) = self.try_eval_bool_lit(vc[0]) {
-                    let vv = if cond_value { self.emit_bits(t) } else { self.emit_bits(e) };
-                    let mut out = Vec::with_capacity(vv.len());
-                    for &l in &vv { out.push(self.alias_bit(l)); }
-                    return out;
-                }
-                
-                let vt = self.emit_bits(t);
-                let ve = self.emit_bits(e);
-                assert_eq!(vt.len(), ve.len());
-                let mut out = Vec::with_capacity(vt.len());
-                for i in 0..vt.len() { out.push(self.ite_bit(vc[0], vt[i], ve[i])); }
-                out
-            }
-            BvTerm::Eq(a, b) => vec![self.bool_eq(a, b)],
-            BvTerm::Ult(a, b) => vec![self.emit_ult_bool(a, b)],
-            BvTerm::Ule(a, b) => vec![self.emit_ule_bool(a, b)],
-            BvTerm::Slt(a, b) => vec![self.emit_slt_bool(a, b)],
-            BvTerm::Sle(a, b) => {
-                // a <= b (signed)  <=>  !(b < a) (signed)
-                let lt = self.emit_slt_bool(b, a);
-                vec![self.mk_not(lt)]
-            }
-            BvTerm::Uaddo(a, b) => {
-                let va = self.emit_bits(a);
-                let vb = self.emit_bits(b);
-                let w = va.len();
-                assert_eq!(w, vb.len());
-                
-                // Compute addition with carry
-                let mut carry = self.const_lit(false);
-                for i in 0..w {
-                    let axb = self.encode_xor_var(va[i], vb[i]);
-                    let carry1 = self.mk_and(&[va[i], vb[i]]);
-                    let carry2 = self.mk_and(&[carry, axb]);
-                    carry = self.mk_or(&[carry1, carry2]);
-                }
-                vec![carry] // overflow if final carry is 1
-            }
-            BvTerm::Saddo(a, b) => {
-                let va = self.emit_bits(a);
-                let vb = self.emit_bits(b);
-                let w = va.len();
-                assert_eq!(w, vb.len());
-                
-                let a_sign = va[w - 1];
-                let b_sign = vb[w - 1];
-                
-                // Compute result
-                let result = self.add_bits(&va, &vb);
-                let result_sign = result[w - 1];
-                
-                // Overflow if signs are same but result sign differs
-                let sign_xor = self.encode_xor_var(a_sign, b_sign);
-                let same_sign = self.mk_not(sign_xor);
-                let sign_diff = self.encode_xor_var(a_sign, result_sign);
-                vec![self.mk_and(&[same_sign, sign_diff])]
-            }
-            BvTerm::Usubo(a, b) => {
-                // Unsigned subtraction overflow: a < b
-                vec![self.emit_ult_bool(a, b)]
-            }
-            BvTerm::Ssubo(a, b) => {
-                let va = self.emit_bits(a);
-                let vb = self.emit_bits(b);
-                let w = va.len();
-                assert_eq!(w, vb.len());
-                
-                let a_sign = va[w - 1];
-                let b_sign = vb[w - 1];
-                
-                // Compute result  
-                let result = self.sub_bits(&va, &vb);
-                let result_sign = result[w - 1];
-                
-                // Overflow if signs differ and result sign != a sign
-                let diff_sign = self.encode_xor_var(a_sign, b_sign);
-                let sign_change = self.encode_xor_var(a_sign, result_sign);
-                vec![self.mk_and(&[diff_sign, sign_change])]
-            }
-            BvTerm::Umulo(a, b) => {
-                let va = self.emit_bits(a);
-                let vb = self.emit_bits(b);
-                let w = va.len();
-                assert_eq!(w, vb.len());
-                
-                // For unsigned multiplication overflow, we need to check if any
-                // bit in the upper half of the 2w-bit result is set
-                let z = self.const_lit(false);
-                let mut acc: Vec<BoolLit> = vec![z; 2 * w]; // 2w bits
-                
-                for i in 0..w {
-                    let mut shifted: Vec<BoolLit> = vec![z; 2 * w];
-                    for j in 0..w {
-                        if i + j < 2 * w {
-                            shifted[i + j] = va[j];
-                        }
-                    }
-                    let mut pp = Vec::with_capacity(2 * w);
-                    for j in 0..2 * w { 
-                        pp.push(self.ite_bit(vb[i], shifted[j], z)); 
-                    }
-                    acc = self.add_bits_extended(&acc, &pp);
-                }
-                
-                // Check if any upper bits are set
-                let mut overflow_terms = Vec::with_capacity(w);
-                for i in w..2*w {
-                    overflow_terms.push(acc[i]);
-                }
-                vec![self.mk_or(&overflow_terms)]
-            }
-            BvTerm::Smulo(a, b) => {
-                // For signed multiplication overflow, use a simplified approach
-                let va = self.emit_bits(a);
-                let vb = self.emit_bits(b);
-                let w = va.len();
-                
-                // Get absolute values  
-                let a_abs = self.abs_bits(&va);
-                let b_abs = self.abs_bits(&vb);
-                
-                // Do unsigned multiplication of absolute values with extended precision
-                let z = self.const_lit(false);
-                let mut acc: Vec<BoolLit> = vec![z; 2 * w];
-                
-                for i in 0..w {
-                    let mut shifted: Vec<BoolLit> = vec![z; 2 * w];
-                    for j in 0..w {
-                        if i + j < 2 * w {
-                            shifted[i + j] = a_abs[j];
-                        }
-                    }
-                    let mut pp = Vec::with_capacity(2 * w);
-                    for j in 0..2 * w { 
-                        pp.push(self.ite_bit(b_abs[i], shifted[j], z)); 
-                    }
-                    acc = self.add_bits_extended(&acc, &pp);
-                }
-                
-                // Check if result exceeds signed range [-(2^(w-1)), 2^(w-1)-1]
-                // This happens if any of the upper w bits are set, or if bit w-1 is set
-                // in the lower w bits (indicating >= 2^(w-1))
-                let mut overflow_terms = Vec::with_capacity(w + 1);
-                for i in w..2*w {
-                    overflow_terms.push(acc[i]);
-                }
-                overflow_terms.push(acc[w - 1]); // MSB of lower half
-                
-                vec![self.mk_or(&overflow_terms)]
-            }
-            BvTerm::Sdivo(a, b) => {
-                let va = self.emit_bits(a);
-                let vb = self.emit_bits(b);
-                let w = va.len();
-                
-                // Signed division overflow occurs when dividing MIN_INT by -1
-                // MIN_INT = 100...0, -1 = 111...1
-                let a_is_min = {
-                    let mut terms = vec![va[w - 1]]; // MSB must be 1
-                    for i in 0..w-1 {
-                        terms.push(self.mk_not(va[i])); // other bits must be 0
-                    }
-                    self.mk_and(&terms)
-                };
-                
-                let b_is_neg_one = {
-                    let mut terms = Vec::with_capacity(w);
-                    for i in 0..w {
-                        terms.push(vb[i]); // all bits must be 1
-                    }
-                    self.mk_and(&terms)
-                };
-                
-                vec![self.mk_and(&[a_is_min, b_is_neg_one])]
-            }
-            BvTerm::Nego(a) => {
-                let va = self.emit_bits(a);
-                let w = va.len();
-                
-                // Negation overflow occurs when negating MIN_INT (100...0)
-                let mut terms = vec![va[w - 1]]; // MSB must be 1
-                for i in 0..w-1 {
-                    terms.push(self.mk_not(va[i])); // other bits must be 0
-                }
-                vec![self.mk_and(&terms)]
-            }
-        }
-    }
-
-    fn alloc_const_bits(&mut self, bits: &[bool]) -> Vec<BoolLit> {
-        let mut out: Vec<BoolLit> = Vec::with_capacity(bits.len());
-        for &b in bits {
-            let var = self.cnf.new_var();
-            let lit = BoolLit(var, b);
-            self.cnf.add_clause(vec![lit]);
-            out.push(lit);
-        }
-        out
-    }
-
-    pub fn blast_equal(&mut self, a: &BvTerm, b: &BvTerm) -> anyhow::Result<()> {
-        let va = self.emit_bits(a);
-        let vb = self.emit_bits(b);
-        if va.len() != vb.len() { return Ok(()); }
-        for i in 0..va.len() {
-            let x = self.encode_xor_var(va[i], vb[i]);
-            let _eq = self.mk_not(x);
-            // Do not combine; just ensure constraints exist
-        }
-        Ok(())
-    }
+fn signed_to_bits(val: i128, width: usize) -> Vec<bool> {
+    let mask = if width >= 128 { !0u128 } else { (1u128 << width) - 1 };
+    to_bits((val as u128) & mask, width)
 }

@@ -1,4 +1,4 @@
-use minismt::solver::cnf::BitBlaster;
+use minismt::solver::bitblast::BitBlaster;
 use minismt::solver::bv::{BvTerm, SortBv};
 
 #[test]

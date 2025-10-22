@@ -5,7 +5,7 @@ use varisat::cnf::CnfFormula;
 use varisat::ExtendFormula;
 use tracing::{debug};
 
-use super::bv::{BoolLit, Cnf};
+use super::cnf::{BoolLit, Cnf};
 
 pub fn solve_cnf(c: &Cnf) -> Result<Option<Vec<bool>>> {
     let mut solver = Solver::new();

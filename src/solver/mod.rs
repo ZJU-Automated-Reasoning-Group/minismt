@@ -5,8 +5,18 @@ pub mod sexpr;
 pub mod smtlib;
 pub mod bv;
 pub mod cnf;
+pub mod aig;
+pub mod aig_cnf;
+pub mod aig_bitblaster;
+pub mod aig_sat_interface;
 pub mod sat;
 pub mod rewrites;
+pub mod config;
+pub mod symbol_table;
+pub mod parsed_item;
+pub mod frontend;
+
+pub use config::SolverConfig;
 
 pub struct SmtSolver {
     engine: smtlib::Engine,
@@ -15,7 +25,21 @@ pub struct SmtSolver {
 impl SmtSolver {
     pub fn new() -> Self {
         Self {
-            engine: smtlib::Engine::new(),
+            engine: smtlib::Engine::new_with_config(SolverConfig::default()),
+        }
+    }
+
+    pub fn new_with_options(check_model: bool) -> Self {
+        let mut config = SolverConfig::default();
+        config.check_model = check_model;
+        Self {
+            engine: smtlib::Engine::new_with_config(config),
+        }
+    }
+    
+    pub fn new_with_config(config: SolverConfig) -> Self {
+        Self {
+            engine: smtlib::Engine::new_with_config(config),
         }
     }
 

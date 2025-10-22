@@ -1,4 +1,5 @@
-use minismt::solver::bv::{BvTerm, BoolLit, SortBv, Cnf};
+use minismt::solver::bv::{BvTerm, SortBv};
+use minismt::solver::cnf::{BoolLit, Cnf};
 
 #[test]
 fn test_sort_bv_creation() {
